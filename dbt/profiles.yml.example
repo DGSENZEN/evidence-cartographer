@@ -1,0 +1,7 @@
+evidence_cartographer:
+  target: dev
+  outputs:
+    dev:
+      type: duckdb
+      path: "{{ env_var('EC_DUCKDB__PATH', '../data/evidence_cartographer.duckdb') }}"
+      threads: 4

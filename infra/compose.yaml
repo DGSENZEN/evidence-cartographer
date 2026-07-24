@@ -1,0 +1,41 @@
+name: evidence-cartographer
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${EC_POSTGRES__DATABASE:-evidence_cartographer}
+      POSTGRES_USER: ${EC_POSTGRES__USER:-evidence_cartographer}
+      POSTGRES_PASSWORD: ${EC_POSTGRES__PASSWORD:-evidence_cartographer}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  minio:
+    image: quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${EC_OBJECT_STORE__ACCESS_KEY:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${EC_OBJECT_STORE__SECRET_KEY:-minioadmin}
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  postgres-data:
+  minio-data:

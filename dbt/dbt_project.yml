@@ -1,0 +1,16 @@
+name: evidence_cartographer
+version: 1.0.0
+config-version: 2
+profile: evidence_cartographer
+model-paths: ["models"]
+target-path: "target"
+clean-targets: ["target", "dbt_packages"]
+
+models:
+  evidence_cartographer:
+    staging:
+      +materialized: view
+    intermediate:
+      +materialized: incremental
+    marts:
+      +materialized: table
