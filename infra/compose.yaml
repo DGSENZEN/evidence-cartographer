@@ -6,9 +6,9 @@ services:
     environment:
       POSTGRES_DB: ${EC_POSTGRES__DATABASE:-evidence_cartographer}
       POSTGRES_USER: ${EC_POSTGRES__USER:-evidence_cartographer}
-      POSTGRES_PASSWORD: ${EC_POSTGRES__PASSWORD:-evidence_cartographer}
+      POSTGRES_PASSWORD: ${EC_POSTGRES__PASSWORD:?EC_POSTGRES__PASSWORD is required}
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
     healthcheck:
@@ -23,11 +23,11 @@ services:
     image: quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z
     command: server /data --console-address ":9001"
     environment:
-      MINIO_ROOT_USER: ${EC_OBJECT_STORE__ACCESS_KEY:-minioadmin}
-      MINIO_ROOT_PASSWORD: ${EC_OBJECT_STORE__SECRET_KEY:-minioadmin}
+      MINIO_ROOT_USER: ${EC_OBJECT_STORE__ACCESS_KEY:?EC_OBJECT_STORE__ACCESS_KEY is required}
+      MINIO_ROOT_PASSWORD: ${EC_OBJECT_STORE__SECRET_KEY:?EC_OBJECT_STORE__SECRET_KEY is required}
     ports:
-      - "9000:9000"
-      - "9001:9001"
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
     volumes:
       - minio-data:/data
     healthcheck:

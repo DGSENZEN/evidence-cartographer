@@ -12,4 +12,8 @@ provenance:
     - source_record_id
     - ingestion_run_id
     - observed_at
+    - source_url
+    - retrieval_status
+    - retrieved_at
     - raw_uri
+    - acquisition_context

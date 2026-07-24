@@ -7,8 +7,17 @@ from evidence_cartographer.application.contracts import (
     ContractResult,
     GoldEligibilitySignals,
 )
+from evidence_cartographer.application.resolution import (
+    ResolutionCandidate,
+    ResolutionReview,
+)
 from evidence_cartographer.domain.enums import IngestionMode, SourceName
-from evidence_cartographer.domain.models import Object, SourceRecord
+from evidence_cartographer.domain.models import (
+    DataQualityResult,
+    Object,
+    SCD2Period,
+    SourceRecord,
+)
 
 
 class RawRecord(BaseModel):
@@ -34,6 +43,29 @@ class BronzeWriter(Protocol):
 
 class CanonicalMapper(Protocol):
     def map_object(self, record: RawRecord, provenance: SourceRecord) -> Object: ...
+
+
+class SilverWriter(Protocol):
+    def append_version(
+        self,
+        object_: Object,
+        period: SCD2Period,
+        quality: DataQualityResult,
+    ) -> None: ...
+
+
+class DataQualityAssessor(Protocol):
+    def assess(
+        self,
+        object_: Object,
+        provenance: SourceRecord,
+    ) -> DataQualityResult: ...
+
+
+class ResolutionWriter(Protocol):
+    def append_candidate(self, candidate: ResolutionCandidate) -> None: ...
+
+    def append_review(self, review: ResolutionReview) -> None: ...
 
 
 class GoldPublisher(Protocol):

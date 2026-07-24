@@ -5,7 +5,8 @@
 `acquire → contract → Bronze append → canonical map → Silver quality/history → Gold policy`
 
 Every source observation remains addressable by ingestion run, source identity,
-contract version, observation timestamp, raw object URI, and contract outcome.
+contract version, observation timestamp, source URL, retrieval status and
+timestamp, raw object URI, typed acquisition context, and contract outcome.
 
 ## Ownership rules
 

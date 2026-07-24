@@ -1,7 +1,8 @@
 from datetime import date
+from typing import Self
 from uuid import UUID, uuid4
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validator
 
 from .enums import (
     ContractOutcome,
@@ -14,6 +15,10 @@ from .enums import (
 
 class DomainModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
+
+
+class AcquisitionContext(DomainModel):
+    mode: IngestionMode
 
 
 class Entity(DomainModel):
@@ -78,6 +83,17 @@ class Image(Entity):
     retrieval_status: RetrievalStatus = RetrievalStatus.NOT_REQUESTED
     cached_uri: str | None = None
 
+    @model_validator(mode="after")
+    def validate_cache_state(self) -> Self:
+        if self.retrieval_status is RetrievalStatus.CACHED and self.cached_uri is None:
+            raise ValueError("cached images require cached_uri")
+        if (
+            self.cached_uri is not None
+            and self.retrieval_status is not RetrievalStatus.CACHED
+        ):
+            raise ValueError("cached_uri requires a cached retrieval status")
+        return self
+
 
 class ObjectPersonRole(Entity):
     object_id: UUID
@@ -100,7 +116,11 @@ class SourceRecord(Entity):
     contract_version: str
     ingestion_run_id: UUID
     observed_at: AwareDatetime
+    source_url: str
+    retrieval_status: RetrievalStatus
+    retrieved_at: AwareDatetime
     raw_uri: str
+    acquisition_context: AcquisitionContext
     raw_checksum: str | None = None
     attribution_text: str | None = None
     outcome: ContractOutcome
@@ -112,6 +132,17 @@ class IngestionRun(Entity):
     status: RunStatus
     started_at: AwareDatetime
     ended_at: AwareDatetime | None = None
+
+    @model_validator(mode="after")
+    def validate_lifecycle_state(self) -> Self:
+        is_terminal = self.status in {RunStatus.SUCCEEDED, RunStatus.FAILED}
+        if is_terminal and self.ended_at is None:
+            raise ValueError("terminal ingestion runs require ended_at")
+        if not is_terminal and self.ended_at is not None:
+            raise ValueError("non-terminal ingestion runs cannot have ended_at")
+        if self.ended_at is not None and self.ended_at < self.started_at:
+            raise ValueError("ended_at cannot precede started_at")
+        return self
 
 
 class QualityCheck(DomainModel):
@@ -131,3 +162,13 @@ class SCD2Period(DomainModel):
     valid_from: AwareDatetime
     valid_to: AwareDatetime | None = None
     is_current: bool
+
+    @model_validator(mode="after")
+    def validate_period(self) -> Self:
+        if self.valid_to is not None and self.valid_to < self.valid_from:
+            raise ValueError("valid_to cannot precede valid_from")
+        if self.is_current and self.valid_to is not None:
+            raise ValueError("current periods require valid_to=None")
+        if not self.is_current and self.valid_to is None:
+            raise ValueError("non-current periods require valid_to")
+        return self
