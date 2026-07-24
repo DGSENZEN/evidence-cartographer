@@ -197,6 +197,18 @@ cython_debug/
 # Local agent workflow state
 .superpowers/
 
+# Evidence Cartographer local state
+.env
+data/*
+!data/.gitkeep
+*.duckdb
+*.duckdb.wal
+dbt/profiles.yml
+dbt/target/
+dbt/logs/
+dbt/dbt_packages/
+.prefect/
+
 # Visual Studio Code
 #   Visual Studio Code specific template is maintained in a separate VisualStudioCode.gitignore 
 #   that can be found at https://github.com/github/gitignore/blob/main/Global/VisualStudioCode.gitignore
