@@ -27,8 +27,20 @@ def test_weak_candidate_defaults_to_human_review() -> None:
         ),
         confidence=0.85,
     )
-    assert candidate.decision is ResolutionDecision.UNREVIEWED
+    assert not hasattr(candidate, "decision")
+    assert not hasattr(candidate, "reviewer_note")
     assert not candidate.can_auto_link
+
+
+def test_resolution_candidate_rejects_a_pre_decided_state() -> None:
+    with pytest.raises(ValidationError):
+        ResolutionCandidate(
+            left_person_id=uuid4(),
+            right_person_id=uuid4(),
+            evidence=(),
+            confidence=0.85,
+            decision=ResolutionDecision.LINK,
+        )
 
 
 def test_resolution_review_captures_a_human_decision() -> None:
@@ -39,13 +51,14 @@ def test_resolution_review_captures_a_human_decision() -> None:
         right_person_id=right_person_id,
         decision=ResolutionDecision.LINK,
         reviewed_at=datetime.now(UTC),
-        reviewer_id="curator@example.test",
+        reviewer_id="  curator@example.test  ",
         note="Authority identifiers match.",
     )
 
     assert review.left_person_id == left_person_id
     assert review.right_person_id == right_person_id
     assert review.decision is ResolutionDecision.LINK
+    assert review.reviewer_id == "curator@example.test"
 
 
 def test_resolution_review_rejects_unreviewed_decision() -> None:
@@ -56,4 +69,15 @@ def test_resolution_review_rejects_unreviewed_decision() -> None:
             decision=ResolutionDecision.UNREVIEWED,
             reviewed_at=datetime.now(UTC),
             reviewer_id="curator@example.test",
+        )
+
+
+def test_resolution_review_rejects_blank_reviewer_identity() -> None:
+    with pytest.raises(ValidationError):
+        ResolutionReview(
+            left_person_id=uuid4(),
+            right_person_id=uuid4(),
+            decision=ResolutionDecision.REJECT,
+            reviewed_at=datetime.now(UTC),
+            reviewer_id="   ",
         )

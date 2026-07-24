@@ -1281,7 +1281,7 @@ Run: `uv run pytest tests/config/test_manifests.py -q`
 
 Expected: PASS.
 
-Run: `docker compose -f infra/compose.yaml config --quiet`
+Run: `docker compose --env-file .env -f infra/compose.yaml config --quiet`
 
 Expected: exit code 0.
 
@@ -1379,7 +1379,7 @@ implemented.
 ```bash
 uv sync --all-extras
 cp .env.example .env
-docker compose -f infra/compose.yaml up -d
+docker compose --env-file .env -f infra/compose.yaml up -d
 ```
 
 ## Checks
@@ -1389,7 +1389,7 @@ uv run pytest
 uv run ruff check .
 uv run ruff format --check .
 uv run mypy src
-docker compose -f infra/compose.yaml config --quiet
+docker compose --env-file .env -f infra/compose.yaml config --quiet
 ```
 
 ## Package boundaries
@@ -1484,7 +1484,7 @@ Run: `uv run mypy src`
 
 Expected: PASS with no type errors.
 
-Run: `docker compose -f infra/compose.yaml config --quiet`
+Run: `docker compose --env-file .env -f infra/compose.yaml config --quiet`
 
 Expected: exit code 0.
 

@@ -18,7 +18,14 @@ implemented.
 ```bash
 uv sync --all-extras
 cp .env.example .env
-docker compose -f infra/compose.yaml up -d
+```
+
+After copying the environment file, fill all three required credential values:
+`EC_POSTGRES__PASSWORD`, `EC_OBJECT_STORE__ACCESS_KEY`, and
+`EC_OBJECT_STORE__SECRET_KEY`. Then start the local services:
+
+```bash
+docker compose --env-file .env -f infra/compose.yaml up -d
 ```
 
 ## Checks
@@ -28,7 +35,7 @@ uv run pytest
 uv run ruff check .
 uv run ruff format --check .
 uv run mypy src
-docker compose -f infra/compose.yaml config --quiet
+docker compose --env-file .env -f infra/compose.yaml config --quiet
 ```
 
 ## Package boundaries

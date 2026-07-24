@@ -29,8 +29,6 @@ class ResolutionCandidate(BaseModel):
     right_person_id: UUID
     evidence: tuple[MatchEvidence, ...]
     confidence: float = Field(ge=0.0, le=1.0)
-    decision: ResolutionDecision = ResolutionDecision.UNREVIEWED
-    reviewer_note: str | None = None
 
     @computed_field  # type: ignore[prop-decorator]
     @property
@@ -49,6 +47,14 @@ class ResolutionReview(BaseModel):
     reviewed_at: AwareDatetime
     reviewer_id: str
     note: str | None = None
+
+    @field_validator("reviewer_id")
+    @classmethod
+    def normalize_reviewer_id(cls, reviewer_id: str) -> str:
+        normalized = reviewer_id.strip()
+        if not normalized:
+            raise ValueError("reviewer identity cannot be blank")
+        return normalized
 
     @field_validator("decision")
     @classmethod

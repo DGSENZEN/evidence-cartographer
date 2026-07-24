@@ -11,6 +11,7 @@ from evidence_cartographer.application.resolution import (
     ResolutionCandidate,
     ResolutionReview,
 )
+from evidence_cartographer.application.retry import RetryDecider
 from evidence_cartographer.domain.enums import IngestionMode, SourceName
 from evidence_cartographer.domain.models import (
     DataQualityResult,
@@ -30,7 +31,11 @@ class RawRecord(BaseModel):
 class SourceAdapter(Protocol):
     source: SourceName
 
-    def acquire(self, mode: IngestionMode) -> Iterable[RawRecord]: ...
+    def acquire(
+        self,
+        mode: IngestionMode,
+        retry_decider: RetryDecider,
+    ) -> Iterable[RawRecord]: ...
 
 
 class ContractValidator(Protocol):
@@ -38,7 +43,12 @@ class ContractValidator(Protocol):
 
 
 class BronzeWriter(Protocol):
-    def append(self, record: RawRecord, provenance: SourceRecord) -> None: ...
+    def append(
+        self,
+        record: RawRecord,
+        provenance: SourceRecord,
+        result: ContractResult,
+    ) -> None: ...
 
 
 class CanonicalMapper(Protocol):

@@ -81,3 +81,41 @@ def test_env_example_documents_complete_nested_configuration() -> None:
         if line and not line.startswith("#") and "=" in line
     }
     assert expected_keys <= documented_keys
+
+
+def test_required_credentials_remain_blank_in_env_example() -> None:
+    env_lines = set(Path(".env.example").read_text().splitlines())
+    assert "EC_POSTGRES__PASSWORD=" in env_lines
+    assert "EC_OBJECT_STORE__ACCESS_KEY=" in env_lines
+    assert "EC_OBJECT_STORE__SECRET_KEY=" in env_lines
+
+
+def test_compose_examples_use_the_root_environment_file() -> None:
+    paths = (
+        Path("README.md"),
+        Path("docs/superpowers/plans/2026-07-23-project-scaffold.md"),
+    )
+    compose_examples = [
+        line.strip()
+        for path in paths
+        for line in path.read_text().splitlines()
+        if "docker compose" in line
+    ]
+
+    assert compose_examples
+    assert all(
+        "docker compose --env-file .env -f infra/compose.yaml" in example
+        for example in compose_examples
+    )
+
+
+def test_readme_requires_users_to_fill_all_three_credentials() -> None:
+    readme = Path("README.md").read_text()
+    required_credentials = (
+        "EC_POSTGRES__PASSWORD",
+        "EC_OBJECT_STORE__ACCESS_KEY",
+        "EC_OBJECT_STORE__SECRET_KEY",
+    )
+
+    assert "fill" in readme.lower()
+    assert all(credential in readme for credential in required_credentials)
