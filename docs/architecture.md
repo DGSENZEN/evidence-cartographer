@@ -18,9 +18,9 @@ contract version, observation timestamp, raw object URI, and contract outcome.
 
 ## Image policy
 
-Metadata and source URLs are ingested for all images. Cached image objects have
-their own retrieval state and object URI. An external URL is never equivalent
-to a permanently stored image.
+When implemented, ingestion must retain metadata and source URLs for all
+images. Cached image objects have their own retrieval state and object URI. An
+external URL is never equivalent to a permanently stored image.
 
 ## History
 
