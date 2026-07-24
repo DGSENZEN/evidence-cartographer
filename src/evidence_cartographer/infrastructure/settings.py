@@ -9,13 +9,13 @@ class PostgresSettings(BaseModel):
     port: int = 5432
     database: str = "evidence_cartographer"
     user: str = "evidence_cartographer"
-    password: SecretStr = SecretStr("evidence_cartographer")
+    password: SecretStr
 
 
 class ObjectStoreSettings(BaseModel):
     endpoint: str = "localhost:9000"
-    access_key: str = "minioadmin"
-    secret_key: SecretStr = SecretStr("minioadmin")
+    access_key: str
+    secret_key: SecretStr
     secure: bool = False
     bronze_bucket: str = "bronze"
     silver_bucket: str = "silver"
@@ -49,8 +49,8 @@ class Settings(BaseSettings):
 
     environment: str = "development"
     log_level: str = "INFO"
-    postgres: PostgresSettings = PostgresSettings()
-    object_store: ObjectStoreSettings = ObjectStoreSettings()
+    postgres: PostgresSettings
+    object_store: ObjectStoreSettings
     duckdb: DuckDBSettings = DuckDBSettings()
     refresh: RefreshSettings = RefreshSettings()
     sources: SourceEndpoints = SourceEndpoints()
