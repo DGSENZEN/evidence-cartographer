@@ -58,11 +58,33 @@ class FakeMinioClient:
         self.content_types: dict[str, str] = {}
         self.upload_order: list[str] = []
         self.fail_on: str | None = None
+        self.create_before_put: str | None = None
+        self.mutate_path_on_stat: tuple[Path, bytes] | None = None
 
     def stat_object(self, bucket_name: str, object_name: str) -> object:
+        if self.mutate_path_on_stat is not None:
+            path, replacement = self.mutate_path_on_stat
+            path.write_bytes(replacement)
+            self.mutate_path_on_stat = None
         if object_name not in self.objects:
             raise missing_object_error(bucket_name, object_name)
         return object()
+
+    def put_object_if_absent(
+        self,
+        bucket_name: str,
+        object_name: str,
+        data: BinaryIO,
+        length: int,
+        content_type: str = "application/octet-stream",
+    ) -> bool:
+        self._create_racing_object(object_name)
+        if self.fail_on == object_name:
+            raise RuntimeError("synthetic MinIO failure")
+        if object_name in self.objects:
+            return False
+        self._store(object_name, data, length, content_type)
+        return True
 
     def put_object(
         self,
@@ -72,14 +94,29 @@ class FakeMinioClient:
         length: int,
         content_type: str = "application/octet-stream",
     ) -> object:
+        self._create_racing_object(object_name)
         if self.fail_on == object_name:
             raise RuntimeError("synthetic MinIO failure")
+        self._store(object_name, data, length, content_type)
+        return object()
+
+    def _create_racing_object(self, object_name: str) -> None:
+        if self.create_before_put == object_name:
+            self.objects[object_name] = b"written by another producer"
+            self.create_before_put = None
+
+    def _store(
+        self,
+        object_name: str,
+        data: BinaryIO,
+        length: int,
+        content_type: str,
+    ) -> None:
         payload = data.read(length)
         assert len(payload) == length
         self.objects[object_name] = payload
         self.content_types[object_name] = content_type
         self.upload_order.append(object_name)
-        return object()
 
 
 def make_artifact(path: Path, expected_sha256: str | None = None) -> BronzeArtifact:
@@ -212,6 +249,43 @@ def test_rejects_checksum_mismatch_before_upload(tmp_path: Path) -> None:
     with pytest.raises(ArtifactIntegrityError):
         store.store_bundle(make_artifact(path, "0" * 64), ())
     assert client.upload_order == []
+
+
+def test_rejects_racing_writer_without_overwriting_its_artifact(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "met.csv"
+    path.write_bytes(b"source")
+    client = FakeMinioClient()
+    artifact_key = f"raw/met/year=2026/month=07/day=27/run={RUN_ID}/source.csv"
+    client.create_before_put = artifact_key
+    store = MinioBronzeArtifactStore(client, "bronze", "raw")
+
+    with pytest.raises(ObjectAlreadyExistsError):
+        store.store_bundle(make_artifact(path), ())
+
+    assert client.objects[artifact_key] == b"written by another producer"
+    assert client.upload_order == []
+
+
+def test_uploads_the_hashed_artifact_snapshot_when_local_file_mutates(
+    tmp_path: Path,
+) -> None:
+    original_bytes = b"original"
+    replacement_bytes = b"replaced"
+    path = tmp_path / "met.csv"
+    path.write_bytes(original_bytes)
+    client = FakeMinioClient()
+    client.mutate_path_on_stat = (path, replacement_bytes)
+    store = MinioBronzeArtifactStore(client, "bronze", "raw")
+
+    receipt = store.store_bundle(make_artifact(path), ())
+
+    assert path.read_bytes() == replacement_bytes
+    assert client.objects[receipt.artifact.uri.removeprefix("s3://bronze/")] == (
+        original_bytes
+    )
+    assert receipt.artifact.sha256 == hashlib.sha256(original_bytes).hexdigest()
 
 
 @pytest.mark.parametrize(

@@ -45,6 +45,15 @@ class MinioClient(Protocol):
         content_type: str = "application/octet-stream",
     ) -> object: ...
 
+    def put_object_if_absent(
+        self,
+        bucket_name: str,
+        object_name: str,
+        data: BinaryIO,
+        length: int,
+        content_type: str = "application/octet-stream",
+    ) -> bool: ...
+
 
 class MinioBronzeArtifactStore(BronzeArtifactStore):
     def __init__(
@@ -65,56 +74,68 @@ class MinioBronzeArtifactStore(BronzeArtifactStore):
         if not artifact.local_path.is_file():
             raise ArtifactNotFoundError(str(artifact.local_path))
 
-        size_bytes, sha256 = self._file_metadata(artifact)
-        keys = build_bronze_object_keys(artifact, self._bronze_prefix)
-        self._assert_bundle_absent(keys)
-        artifact_object = StoredObject(
-            uri=self._uri(keys.artifact),
-            size_bytes=size_bytes,
-            sha256=sha256,
-        )
+        with SpooledTemporaryFile(max_size=SPOOL_MAX_SIZE, mode="w+b") as snapshot:
+            binary_snapshot = cast(BinaryIO, snapshot)
+            size_bytes, sha256 = self._snapshot_artifact(artifact, binary_snapshot)
+            keys = build_bronze_object_keys(artifact, self._bronze_prefix)
+            self._assert_bundle_absent(keys)
+            artifact_object = StoredObject(
+                uri=self._uri(keys.artifact),
+                size_bytes=size_bytes,
+                sha256=sha256,
+            )
 
-        with artifact.local_path.open("rb") as source:
-            self._put(keys.artifact, source, size_bytes, artifact.media_type)
+            snapshot.seek(0)
+            self._put_if_absent(
+                keys.artifact,
+                binary_snapshot,
+                size_bytes,
+                artifact.media_type,
+            )
 
-        evidence_object, total_records, outcome_counts = self._write_evidence(
-            artifact,
-            evidence,
-            keys.evidence_manifest,
-        )
-        completion = BronzeCompletionManifest(
-            source=artifact.source,
-            ingestion_run_id=artifact.ingestion_run_id,
-            retrieved_at=artifact.retrieved_at,
-            source_url=artifact.source_url,
-            contract_version=artifact.contract_version,
-            artifact=artifact_object,
-            evidence_manifest=evidence_object,
-            total_records=total_records,
-            outcome_counts=outcome_counts,
-        )
-        completion_bytes = _canonical_json(completion.model_dump(mode="json"))
-        self._put(
-            keys.completion_manifest,
-            BytesIO(completion_bytes),
-            len(completion_bytes),
-            "application/json",
-        )
-        return BronzeBundleReceipt(
-            source=artifact.source,
-            ingestion_run_id=artifact.ingestion_run_id,
-            artifact=artifact_object,
-            evidence_manifest=evidence_object,
-            completion_manifest_uri=self._uri(keys.completion_manifest),
-        )
+            evidence_object, total_records, outcome_counts = self._write_evidence(
+                artifact,
+                evidence,
+                keys.evidence_manifest,
+            )
+            completion = BronzeCompletionManifest(
+                source=artifact.source,
+                ingestion_run_id=artifact.ingestion_run_id,
+                retrieved_at=artifact.retrieved_at,
+                source_url=artifact.source_url,
+                contract_version=artifact.contract_version,
+                artifact=artifact_object,
+                evidence_manifest=evidence_object,
+                total_records=total_records,
+                outcome_counts=outcome_counts,
+            )
+            completion_bytes = _canonical_json(completion.model_dump(mode="json"))
+            self._put_if_absent(
+                keys.completion_manifest,
+                BytesIO(completion_bytes),
+                len(completion_bytes),
+                "application/json",
+            )
+            return BronzeBundleReceipt(
+                source=artifact.source,
+                ingestion_run_id=artifact.ingestion_run_id,
+                artifact=artifact_object,
+                evidence_manifest=evidence_object,
+                completion_manifest_uri=self._uri(keys.completion_manifest),
+            )
 
-    def _file_metadata(self, artifact: BronzeArtifact) -> tuple[int, str]:
+    def _snapshot_artifact(
+        self,
+        artifact: BronzeArtifact,
+        snapshot: BinaryIO,
+    ) -> tuple[int, str]:
         digest = hashlib.sha256()
         size_bytes = 0
         with artifact.local_path.open("rb") as source:
             while chunk := source.read(HASH_CHUNK_SIZE):
                 digest.update(chunk)
                 size_bytes += len(chunk)
+                snapshot.write(chunk)
         sha256 = digest.hexdigest()
         if artifact.expected_sha256 is not None and sha256 != artifact.expected_sha256:
             raise ArtifactIntegrityError(
@@ -162,7 +183,7 @@ class MinioBronzeArtifactStore(BronzeArtifactStore):
                     total_records += 1
                 size_bytes = spool.tell()
                 spool.seek(0)
-                self._put(
+                self._put_if_absent(
                     key,
                     cast(BinaryIO, spool),
                     size_bytes,
@@ -203,7 +224,7 @@ class MinioBronzeArtifactStore(BronzeArtifactStore):
                 "provenance outcome does not match contract result"
             )
 
-    def _put(
+    def _put_if_absent(
         self,
         key: str,
         data: BinaryIO,
@@ -211,7 +232,7 @@ class MinioBronzeArtifactStore(BronzeArtifactStore):
         content_type: str,
     ) -> None:
         try:
-            self._client.put_object(
+            created = self._client.put_object_if_absent(
                 self._bucket_name,
                 key,
                 data,
@@ -220,6 +241,8 @@ class MinioBronzeArtifactStore(BronzeArtifactStore):
             )
         except Exception as exc:
             raise ObjectStoreError(f"could not write {self._uri(key)}") from exc
+        if not created:
+            raise ObjectAlreadyExistsError(self._uri(key))
 
     def _uri(self, key: str) -> str:
         return f"s3://{self._bucket_name}/{key}"
