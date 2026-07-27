@@ -2,10 +2,8 @@ from collections.abc import Iterable
 from inspect import Parameter, signature
 from typing import get_type_hints
 
-from evidence_cartographer.application.contracts import ContractResult
 from evidence_cartographer.application.errors import EvidenceCartographerError
 from evidence_cartographer.application.ports import (
-    BronzeWriter,
     DataQualityAssessor,
     RawRecord,
     ResolutionWriter,
@@ -61,14 +59,6 @@ def test_source_adapter_receives_the_exact_retry_decider() -> None:
     tuple(adapter.acquire(IngestionMode.FULL_SNAPSHOT, retry_decider))
 
     assert adapter.received_decider is retry_decider
-
-
-def test_bronze_writer_requires_contract_validation_evidence() -> None:
-    annotations = get_type_hints(BronzeWriter.append)
-    result_parameter = signature(BronzeWriter.append).parameters["result"]
-
-    assert annotations["result"] is ContractResult
-    assert result_parameter.default is Parameter.empty
 
 
 def test_silver_writer_exposes_append_only_canonical_version_boundary() -> None:

@@ -42,15 +42,6 @@ class ContractValidator(Protocol):
     def validate(self, record: RawRecord) -> ContractResult: ...
 
 
-class BronzeWriter(Protocol):
-    def append(
-        self,
-        record: RawRecord,
-        provenance: SourceRecord,
-        result: ContractResult,
-    ) -> None: ...
-
-
 class CanonicalMapper(Protocol):
     def map_object(self, record: RawRecord, provenance: SourceRecord) -> Object: ...
 
