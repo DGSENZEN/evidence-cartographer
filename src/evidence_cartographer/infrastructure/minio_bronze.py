@@ -4,8 +4,13 @@ from collections.abc import Iterable
 from io import BytesIO
 from tempfile import SpooledTemporaryFile
 from typing import BinaryIO, Protocol, cast
+from urllib.parse import urlunsplit
 
+from minio import Minio
+from minio import time as minio_time
 from minio.error import S3Error
+from minio.helpers import DictType
+from minio.signer import sign_v4_s3
 
 from evidence_cartographer.application.bronze import (
     BronzeArtifact,
@@ -189,7 +194,11 @@ class MinioBronzeArtifactStore(BronzeArtifactStore):
                     size_bytes,
                     "application/x-ndjson",
                 )
-        except (ManifestSerializationError, ObjectStoreError):
+        except (
+            ManifestSerializationError,
+            ObjectAlreadyExistsError,
+            ObjectStoreError,
+        ):
             raise
         except Exception as exc:
             raise ManifestSerializationError(
@@ -232,13 +241,23 @@ class MinioBronzeArtifactStore(BronzeArtifactStore):
         content_type: str,
     ) -> None:
         try:
-            created = self._client.put_object_if_absent(
-                self._bucket_name,
-                key,
-                data,
-                length,
-                content_type=content_type,
-            )
+            if isinstance(self._client, Minio):
+                created = _put_minio_object_if_absent(
+                    self._client,
+                    self._bucket_name,
+                    key,
+                    data,
+                    length,
+                    content_type,
+                )
+            else:
+                created = self._client.put_object_if_absent(
+                    self._bucket_name,
+                    key,
+                    data,
+                    length,
+                    content_type=content_type,
+                )
         except Exception as exc:
             raise ObjectStoreError(f"could not write {self._uri(key)}") from exc
         if not created:
@@ -255,3 +274,67 @@ def _canonical_json(value: object) -> bytes:
         separators=(",", ":"),
         sort_keys=True,
     ).encode("utf-8")
+
+
+def _put_minio_object_if_absent(
+    client: Minio,
+    bucket_name: str,
+    object_name: str,
+    data: BinaryIO,
+    length: int,
+    content_type: str,
+) -> bool:
+    region = client._get_region(bucket_name)
+    url = client._base_url.build(
+        method="PUT",
+        region=region,
+        bucket_name=bucket_name,
+        object_name=object_name,
+    )
+    request_time = minio_time.utcnow()
+    headers: DictType = {
+        "Content-Length": str(length),
+        "Content-Type": content_type,
+        "Host": url.netloc,
+        "If-None-Match": "*",
+        "User-Agent": client._user_agent,
+        "x-amz-date": minio_time.to_amz_date(request_time),
+    }
+    credentials = client._provider.retrieve() if client._provider else None
+    if credentials:
+        content_sha256 = (
+            "UNSIGNED-PAYLOAD" if client._base_url.is_https else _stream_sha256(data)
+        )
+        headers["x-amz-content-sha256"] = content_sha256
+        if credentials.session_token:
+            headers["X-Amz-Security-Token"] = credentials.session_token
+        headers = sign_v4_s3(
+            method="PUT",
+            url=url,
+            region=region,
+            headers=headers,
+            credentials=credentials,
+            content_sha256=content_sha256,
+            date=request_time,
+        )
+    response = client._http.urlopen(
+        "PUT",
+        urlunsplit(url),
+        body=data,
+        headers=headers,
+        preload_content=True,
+    )
+    if response.status in (200, 204):
+        return True
+    if response.status == 412:
+        return False
+    raise RuntimeError(f"conditional MinIO write returned HTTP {response.status}")
+
+
+def _stream_sha256(data: BinaryIO) -> str:
+    position = data.tell()
+    digest = hashlib.sha256()
+    while chunk := data.read(HASH_CHUNK_SIZE):
+        digest.update(chunk)
+    data.seek(position)
+    return digest.hexdigest()

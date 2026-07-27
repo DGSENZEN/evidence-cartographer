@@ -3,10 +3,11 @@ import json
 from collections.abc import Iterable
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import BinaryIO
+from typing import Any, BinaryIO
 from uuid import UUID, uuid4
 
 import pytest
+from minio import Minio
 from minio.error import S3Error
 
 from evidence_cartographer.application.bronze import (
@@ -117,6 +118,25 @@ class FakeMinioClient:
         self.objects[object_name] = payload
         self.content_types[object_name] = content_type
         self.upload_order.append(object_name)
+
+
+class MissingObjectMinio(Minio):
+    def stat_object(self, bucket_name: str, object_name: str) -> object:
+        raise missing_object_error(bucket_name, object_name)
+
+
+class RecordingHttpClient:
+    def __init__(self) -> None:
+        self.requests: list[tuple[str, str, bytes, dict[str, str]]] = []
+
+    def urlopen(self, method: str, url: str, **kwargs: Any) -> object:
+        body = kwargs["body"]
+        headers = kwargs["headers"]
+        self.requests.append((method, url, body.read(), dict(headers)))
+        return type("Response", (), {"status": 200})()
+
+    def clear(self) -> None:
+        return None
 
 
 def make_artifact(path: Path, expected_sha256: str | None = None) -> BronzeArtifact:
@@ -286,6 +306,55 @@ def test_uploads_the_hashed_artifact_snapshot_when_local_file_mutates(
         original_bytes
     )
     assert receipt.artifact.sha256 == hashlib.sha256(original_bytes).hexdigest()
+
+
+def test_real_minio_client_uses_streaming_conditional_puts(tmp_path: Path) -> None:
+    artifact_bytes = b"source"
+    path = tmp_path / "met.csv"
+    path.write_bytes(artifact_bytes)
+    http_client = RecordingHttpClient()
+    client = MissingObjectMinio(
+        "minio.test",
+        access_key="access",
+        secret_key="secret",
+        region="us-east-1",
+    )
+    client._http = http_client  # type: ignore[assignment]
+    store = MinioBronzeArtifactStore(client, "bronze", "raw")
+
+    receipt = store.store_bundle(
+        make_artifact(path),
+        (make_evidence(ContractOutcome.ACCEPTED, "42"),),
+    )
+
+    assert [request[0] for request in http_client.requests] == ["PUT", "PUT", "PUT"]
+    assert all(request[3]["If-None-Match"] == "*" for request in http_client.requests)
+    assert http_client.requests[0][2] == artifact_bytes
+    assert receipt.artifact.sha256 == hashlib.sha256(artifact_bytes).hexdigest()
+
+
+def test_preserves_evidence_create_collision_as_object_exists_error(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "met.csv"
+    path.write_bytes(b"source")
+    client = FakeMinioClient()
+    evidence_key = (
+        f"raw/met/year=2026/month=07/day=27/run={RUN_ID}/records.manifest.jsonl"
+    )
+    client.create_before_put = evidence_key
+    store = MinioBronzeArtifactStore(client, "bronze", "raw")
+
+    with pytest.raises(ObjectAlreadyExistsError):
+        store.store_bundle(
+            make_artifact(path),
+            (make_evidence(ContractOutcome.ACCEPTED, "42"),),
+        )
+
+    assert client.upload_order == [
+        f"raw/met/year=2026/month=07/day=27/run={RUN_ID}/source.csv"
+    ]
+    assert not any(key.endswith("/_SUCCESS.json") for key in client.objects)
 
 
 @pytest.mark.parametrize(
