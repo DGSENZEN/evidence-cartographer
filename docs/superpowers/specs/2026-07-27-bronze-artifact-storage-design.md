@@ -19,7 +19,8 @@ The slice will:
   a completed Bronze bundle;
 - define a `BronzeArtifactStore` application port;
 - implement the port with the MinIO Python SDK;
-- stream large local artifacts and record-evidence manifests;
+- stream local artifacts and record-evidence manifests up to the documented
+  5 GiB conditional single-PUT ceiling;
 - use deterministic, partitioned object keys;
 - preserve full `SourceRecord` provenance and `ContractResult` messages;
 - calculate and record SHA-256 checksums;
@@ -123,9 +124,16 @@ persistence boundaries will not remain.
 
 ## MinIO Adapter
 
-The MinIO implementation depends on a narrow structural client protocol rather
-than constructing a client internally. Application wiring will supply the real
-MinIO SDK client. Tests will supply an in-memory fake.
+The Bronze store depends on the owned `ConditionalObjectClient` structural
+protocol. A `MinioConditionalObjectClient` wraps the real MinIO SDK, while
+store tests supply an in-memory fake with the same truthful interface. A raw
+`minio.Minio` is deliberately not accepted by the store because the public SDK
+does not expose conditional create headers.
+
+The owned wrapper is the only module permitted to use the MinIO SDK's private
+request members. Its compatibility contract is exact-pinned to
+`minio==7.2.20` and `urllib3==2.7.0` and covered by real-client composition and
+request-contract tests.
 
 The adapter:
 
@@ -134,16 +142,34 @@ The adapter:
 3. compares the computed hash with the expected hash when supplied;
 4. derives all deterministic object keys;
 5. checks that none of the target keys already exists;
-6. streams the original artifact to MinIO;
+6. conditionally creates the original artifact with `If-None-Match: *`;
 7. incrementally serializes record evidence as canonical NDJSON;
-8. uploads the NDJSON sidecar;
+8. conditionally creates the NDJSON sidecar;
 9. constructs a deterministic completion manifest with object locations,
    hashes, sizes, contract version, retrieval metadata, and outcome counts;
-10. uploads `_SUCCESS.json` last;
+10. conditionally creates `_SUCCESS.json` last;
 11. returns the typed receipt.
 
 The adapter does not own credentials or read settings directly. Its constructor
-receives the client, bucket name, and Bronze prefix from composition code.
+receives the owned conditional client, bucket name, Bronze prefix, spool memory
+threshold, and optional spool directory from composition code.
+
+### Conditional single-PUT contract
+
+All three bundle payloads use one conditional HTTP PUT. The supported maximum
+is 5 GiB (5,368,709,120 bytes) per object; larger artifacts, evidence
+manifests, or completion manifests fail with `SinglePutSizeLimitError`.
+Multipart upload is intentionally outside this boilerplate slice.
+
+Each request records the expected SHA-256 and byte size in object user metadata.
+The wrapper disables urllib3's implicit retries and redirects, then owns a
+bounded three-attempt loop. Every attempt rewinds the staged stream and is
+signed afresh. HTTP 409 and transient server responses are retried. A 412,
+ambiguous transport failure, or ambiguous server response is reconciled with a
+HEAD request: matching stored checksum and size means the earlier attempt
+committed; mismatching metadata is an object collision; absence permits another
+bounded attempt. Typed diagnostics retain HTTP status, S3 code, message, request
+ID, and host ID where supplied.
 
 ## Serialization
 
@@ -155,22 +181,33 @@ line ends with a newline.
 The completion manifest uses the same canonical JSON settings. It includes
 outcome counts for the four contract statuses and a total record count.
 
-The NDJSON stream is spooled through a bounded temporary file so MinIO receives
-a file-like object and known content length without retaining all evidence in
-memory. Compression is deferred until real dataset measurements justify it.
+The artifact snapshot and NDJSON stream are each spooled through a bounded
+temporary file so the object client receives a seekable file-like object and
+known content length without retaining a complete payload in memory. The
+in-memory threshold and temporary directory are configurable.
+
+The artifact spool is closed immediately after its upload and before evidence
+iteration begins. Temporary-disk capacity therefore needs to accommodate the
+larger of the artifact or evidence manifest, not both simultaneously. With the
+single-PUT contract, allow up to 5 GiB plus filesystem overhead in the selected
+spool directory. Compression is deferred until real dataset measurements
+justify it.
 
 ## Immutability and Failure Semantics
 
-The adapter performs existence checks before uploading. Any existing target key
-causes an `ObjectAlreadyExistsError`; the adapter never overwrites it.
+The adapter performs advisory existence checks before uploading and every write
+also uses a race-safe conditional create. Any existing target key causes an
+`ObjectAlreadyExistsError`; the adapter never overwrites, appends to, or deletes
+an object. Bronze "append-only" means that new runs create new immutable bundle
+prefixes, not that records are appended to an existing object.
 
 The adapter never deletes objects automatically. If artifact or sidecar upload
 succeeds but a later step fails, the prefix remains without `_SUCCESS.json`.
 The failed prefix is auditable and cannot be mistaken for a committed bundle.
 A retry uses a new ingestion-run ID.
 
-This is immutability by application convention. Bucket versioning, object lock,
-and race-proof conditional writes are deployment concerns outside this slice.
+Bucket versioning and object lock remain deployment concerns; race-safe
+create-only writes are enforced by this adapter.
 
 ## Errors
 
@@ -179,13 +216,17 @@ Storage failures are expressed through focused subclasses of the existing
 
 - `ArtifactNotFoundError`;
 - `ArtifactIntegrityError`;
+- `ArtifactStagingError`;
+- `EvidenceStagingError`;
+- `SinglePutSizeLimitError`;
 - `ObjectAlreadyExistsError`;
 - `ManifestSerializationError`;
 - `ObjectStoreError`.
 
-MinIO SDK exceptions are chained into `ObjectStoreError`. Validation and
-serialization errors preserve their original cause. No error is silently
-converted into a successful or quarantined record.
+MinIO SDK and conditional-transport exceptions are chained into
+`ObjectStoreError`, retaining typed conditional diagnostics. Staging,
+validation, and serialization errors preserve their original cause. No error
+is silently converted into a successful or quarantined record.
 
 ## Environment-File Policy
 
@@ -206,8 +247,10 @@ Configuration tests will verify:
 
 ## Testing
 
-All tests use synthetic files and an in-memory fake implementing the narrow
-MinIO client protocol.
+Store tests use synthetic files and an in-memory fake implementing the owned
+conditional-object protocol. Contract tests compose the owned wrapper around a
+real MinIO SDK client with a recording HTTP transport; they do not contact a
+live service.
 
 Tests cover:
 
@@ -220,11 +263,17 @@ Tests cover:
 - preservation of full provenance and contract messages;
 - outcome and total counts in `_SUCCESS.json`;
 - upload ordering with `_SUCCESS.json` last;
+- the 5 GiB ceiling for artifact, evidence, and completion payloads;
+- disabled transport retries/redirects and bounded rewind/re-sign retries;
+- 409 retry and metadata reconciliation after 412 or ambiguous outcomes;
+- typed S3 diagnostics and exact private-API dependency pins;
 - lazy evidence iteration;
 - existing-object rejection before upload;
 - MinIO failure translation;
 - absence of `_SUCCESS.json` after any earlier failure;
 - typed receipt values;
+- configurable spool location and memory threshold;
+- typed artifact/evidence staging failures and sequential spool lifetime;
 - the environment-file policy above.
 
 The full existing test, Ruff, formatting, mypy, dbt parse, and Compose
@@ -244,7 +293,10 @@ The slice is complete when:
    failures produce typed errors.
 5. Partial uploads never contain `_SUCCESS.json`.
 6. No implementation loads the complete source artifact or complete evidence
-   iterable into memory.
+   iterable into memory; each individual stored payload is no larger than
+   5 GiB.
 7. `.env.example` is removed while local `.env` remains ignored and untracked.
 8. No acquisition, parsing, mapping, bucket-bootstrap, or live-service behavior
    is introduced.
+9. The real MinIO SDK composes only through the owned conditional client, with
+   exact compatible dependency pins and retry/reconciliation contract tests.

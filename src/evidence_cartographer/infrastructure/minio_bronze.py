@@ -2,15 +2,11 @@ import hashlib
 import json
 from collections.abc import Iterable
 from io import BytesIO
+from pathlib import Path
 from tempfile import SpooledTemporaryFile
-from typing import BinaryIO, Protocol, cast
-from urllib.parse import urlunsplit
+from typing import BinaryIO, cast
 
-from minio import Minio
-from minio import time as minio_time
 from minio.error import S3Error
-from minio.helpers import DictType
-from minio.signer import sign_v4_s3
 
 from evidence_cartographer.application.bronze import (
     BronzeArtifact,
@@ -23,53 +19,46 @@ from evidence_cartographer.application.bronze import (
 from evidence_cartographer.application.errors import (
     ArtifactIntegrityError,
     ArtifactNotFoundError,
+    ArtifactStagingError,
+    EvidenceStagingError,
     ManifestSerializationError,
     ObjectAlreadyExistsError,
     ObjectStoreError,
+    SinglePutSizeLimitError,
 )
 from evidence_cartographer.domain.enums import ContractOutcome
+from evidence_cartographer.infrastructure.conditional_object_client import (
+    MAX_SINGLE_PUT_SIZE_BYTES,
+    MISSING_OBJECT_CODES,
+    ConditionalObjectClient,
+    ConditionalObjectExistsError,
+)
 from evidence_cartographer.infrastructure.object_keys import (
     BronzeObjectKeys,
     build_bronze_object_keys,
 )
 
 HASH_CHUNK_SIZE = 1024 * 1024
-SPOOL_MAX_SIZE = 8 * 1024 * 1024
-MISSING_OBJECT_CODES = frozenset({"NoSuchKey", "NoSuchObject", "NoSuchResource"})
-
-
-class MinioClient(Protocol):
-    def stat_object(self, bucket_name: str, object_name: str) -> object: ...
-
-    def put_object(
-        self,
-        bucket_name: str,
-        object_name: str,
-        data: BinaryIO,
-        length: int,
-        content_type: str = "application/octet-stream",
-    ) -> object: ...
-
-    def put_object_if_absent(
-        self,
-        bucket_name: str,
-        object_name: str,
-        data: BinaryIO,
-        length: int,
-        content_type: str = "application/octet-stream",
-    ) -> bool: ...
+DEFAULT_SPOOL_MAX_MEMORY_BYTES = 8 * 1024 * 1024
 
 
 class MinioBronzeArtifactStore(BronzeArtifactStore):
     def __init__(
         self,
-        client: MinioClient,
+        client: ConditionalObjectClient,
         bucket_name: str,
         bronze_prefix: str,
+        *,
+        spool_max_memory_bytes: int = DEFAULT_SPOOL_MAX_MEMORY_BYTES,
+        spool_directory: Path | None = None,
     ) -> None:
+        if spool_max_memory_bytes < 1:
+            raise ValueError("spool_max_memory_bytes must be at least 1")
         self._client = client
         self._bucket_name = bucket_name
         self._bronze_prefix = bronze_prefix
+        self._spool_max_memory_bytes = spool_max_memory_bytes
+        self._spool_directory = spool_directory
 
     def store_bundle(
         self,
@@ -79,67 +68,93 @@ class MinioBronzeArtifactStore(BronzeArtifactStore):
         if not artifact.local_path.is_file():
             raise ArtifactNotFoundError(str(artifact.local_path))
 
-        with SpooledTemporaryFile(max_size=SPOOL_MAX_SIZE, mode="w+b") as snapshot:
-            binary_snapshot = cast(BinaryIO, snapshot)
-            size_bytes, sha256 = self._snapshot_artifact(artifact, binary_snapshot)
-            keys = build_bronze_object_keys(artifact, self._bronze_prefix)
-            self._assert_bundle_absent(keys)
-            artifact_object = StoredObject(
-                uri=self._uri(keys.artifact),
-                size_bytes=size_bytes,
-                sha256=sha256,
-            )
+        keys = build_bronze_object_keys(artifact, self._bronze_prefix)
+        try:
+            with SpooledTemporaryFile(
+                max_size=self._spool_max_memory_bytes,
+                mode="w+b",
+                dir=(
+                    str(self._spool_directory)
+                    if self._spool_directory is not None
+                    else None
+                ),
+            ) as snapshot:
+                binary_snapshot = cast(BinaryIO, snapshot)
+                size_bytes, sha256 = self._snapshot_artifact(
+                    artifact,
+                    binary_snapshot,
+                    self._uri(keys.artifact),
+                )
+                self._assert_bundle_absent(keys)
+                artifact_object = StoredObject(
+                    uri=self._uri(keys.artifact),
+                    size_bytes=size_bytes,
+                    sha256=sha256,
+                )
 
-            snapshot.seek(0)
-            self._put_if_absent(
-                keys.artifact,
-                binary_snapshot,
-                size_bytes,
-                artifact.media_type,
-            )
+                snapshot.seek(0)
+                self._put_if_absent(
+                    keys.artifact,
+                    binary_snapshot,
+                    size_bytes,
+                    sha256,
+                    artifact.media_type,
+                )
+        except OSError as exc:
+            raise ArtifactStagingError(
+                f"could not stage acquisition artifact {artifact.local_path}"
+            ) from exc
 
-            evidence_object, total_records, outcome_counts = self._write_evidence(
-                artifact,
-                evidence,
-                keys.evidence_manifest,
-            )
-            completion = BronzeCompletionManifest(
-                source=artifact.source,
-                ingestion_run_id=artifact.ingestion_run_id,
-                retrieved_at=artifact.retrieved_at,
-                source_url=artifact.source_url,
-                contract_version=artifact.contract_version,
-                artifact=artifact_object,
-                evidence_manifest=evidence_object,
-                total_records=total_records,
-                outcome_counts=outcome_counts,
-            )
-            completion_bytes = _canonical_json(completion.model_dump(mode="json"))
-            self._put_if_absent(
-                keys.completion_manifest,
-                BytesIO(completion_bytes),
-                len(completion_bytes),
-                "application/json",
-            )
-            return BronzeBundleReceipt(
-                source=artifact.source,
-                ingestion_run_id=artifact.ingestion_run_id,
-                artifact=artifact_object,
-                evidence_manifest=evidence_object,
-                completion_manifest_uri=self._uri(keys.completion_manifest),
-            )
+        evidence_object, total_records, outcome_counts = self._write_evidence(
+            artifact,
+            evidence,
+            keys.evidence_manifest,
+        )
+        completion = BronzeCompletionManifest(
+            source=artifact.source,
+            ingestion_run_id=artifact.ingestion_run_id,
+            retrieved_at=artifact.retrieved_at,
+            source_url=artifact.source_url,
+            contract_version=artifact.contract_version,
+            artifact=artifact_object,
+            evidence_manifest=evidence_object,
+            total_records=total_records,
+            outcome_counts=outcome_counts,
+        )
+        completion_bytes = _canonical_json(completion.model_dump(mode="json"))
+        self._put_if_absent(
+            keys.completion_manifest,
+            BytesIO(completion_bytes),
+            len(completion_bytes),
+            hashlib.sha256(completion_bytes).hexdigest(),
+            "application/json",
+        )
+        return BronzeBundleReceipt(
+            source=artifact.source,
+            ingestion_run_id=artifact.ingestion_run_id,
+            artifact=artifact_object,
+            evidence_manifest=evidence_object,
+            completion_manifest_uri=self._uri(keys.completion_manifest),
+        )
 
     def _snapshot_artifact(
         self,
         artifact: BronzeArtifact,
         snapshot: BinaryIO,
+        object_uri: str,
     ) -> tuple[int, str]:
         digest = hashlib.sha256()
         size_bytes = 0
         with artifact.local_path.open("rb") as source:
             while chunk := source.read(HASH_CHUNK_SIZE):
-                digest.update(chunk)
                 size_bytes += len(chunk)
+                if size_bytes > MAX_SINGLE_PUT_SIZE_BYTES:
+                    raise SinglePutSizeLimitError(
+                        object_uri,
+                        size_bytes,
+                        MAX_SINGLE_PUT_SIZE_BYTES,
+                    )
+                digest.update(chunk)
                 snapshot.write(chunk)
         sha256 = digest.hexdigest()
         if artifact.expected_sha256 is not None and sha256 != artifact.expected_sha256:
@@ -178,28 +193,50 @@ class MinioBronzeArtifactStore(BronzeArtifactStore):
         total_records = 0
         digest = hashlib.sha256()
         try:
-            with SpooledTemporaryFile(max_size=SPOOL_MAX_SIZE, mode="w+b") as spool:
+            with SpooledTemporaryFile(
+                max_size=self._spool_max_memory_bytes,
+                mode="w+b",
+                dir=(
+                    str(self._spool_directory)
+                    if self._spool_directory is not None
+                    else None
+                ),
+            ) as spool:
+                binary_spool = cast(BinaryIO, spool)
                 for item in evidence:
                     self._validate_evidence(artifact, item)
                     line = _canonical_json(item.model_dump(mode="json")) + b"\n"
-                    spool.write(line)
+                    projected_size = binary_spool.tell() + len(line)
+                    if projected_size > MAX_SINGLE_PUT_SIZE_BYTES:
+                        raise SinglePutSizeLimitError(
+                            self._uri(key),
+                            projected_size,
+                            MAX_SINGLE_PUT_SIZE_BYTES,
+                        )
+                    binary_spool.write(line)
                     digest.update(line)
                     counts[item.result.outcome] += 1
                     total_records += 1
-                size_bytes = spool.tell()
-                spool.seek(0)
+                size_bytes = binary_spool.tell()
+                binary_spool.seek(0)
                 self._put_if_absent(
                     key,
-                    cast(BinaryIO, spool),
+                    binary_spool,
                     size_bytes,
+                    digest.hexdigest(),
                     "application/x-ndjson",
                 )
         except (
             ManifestSerializationError,
             ObjectAlreadyExistsError,
             ObjectStoreError,
+            SinglePutSizeLimitError,
         ):
             raise
+        except OSError as exc:
+            raise EvidenceStagingError(
+                "could not stage Bronze record evidence"
+            ) from exc
         except Exception as exc:
             raise ManifestSerializationError(
                 "could not serialize Bronze record evidence"
@@ -238,30 +275,30 @@ class MinioBronzeArtifactStore(BronzeArtifactStore):
         key: str,
         data: BinaryIO,
         length: int,
+        sha256: str,
         content_type: str,
     ) -> None:
+        if length > MAX_SINGLE_PUT_SIZE_BYTES:
+            raise SinglePutSizeLimitError(
+                self._uri(key),
+                length,
+                MAX_SINGLE_PUT_SIZE_BYTES,
+            )
         try:
-            if isinstance(self._client, Minio):
-                created = _put_minio_object_if_absent(
-                    self._client,
-                    self._bucket_name,
-                    key,
-                    data,
-                    length,
-                    content_type,
-                )
-            else:
-                created = self._client.put_object_if_absent(
-                    self._bucket_name,
-                    key,
-                    data,
-                    length,
-                    content_type=content_type,
-                )
+            self._client.put_object_if_absent(
+                self._bucket_name,
+                key,
+                data,
+                length,
+                sha256,
+                content_type=content_type,
+            )
+        except SinglePutSizeLimitError:
+            raise
+        except ConditionalObjectExistsError as exc:
+            raise ObjectAlreadyExistsError(f"{self._uri(key)}: {exc}") from exc
         except Exception as exc:
-            raise ObjectStoreError(f"could not write {self._uri(key)}") from exc
-        if not created:
-            raise ObjectAlreadyExistsError(self._uri(key))
+            raise ObjectStoreError(f"could not write {self._uri(key)}: {exc}") from exc
 
     def _uri(self, key: str) -> str:
         return f"s3://{self._bucket_name}/{key}"
@@ -274,67 +311,3 @@ def _canonical_json(value: object) -> bytes:
         separators=(",", ":"),
         sort_keys=True,
     ).encode("utf-8")
-
-
-def _put_minio_object_if_absent(
-    client: Minio,
-    bucket_name: str,
-    object_name: str,
-    data: BinaryIO,
-    length: int,
-    content_type: str,
-) -> bool:
-    region = client._get_region(bucket_name)
-    url = client._base_url.build(
-        method="PUT",
-        region=region,
-        bucket_name=bucket_name,
-        object_name=object_name,
-    )
-    request_time = minio_time.utcnow()
-    headers: DictType = {
-        "Content-Length": str(length),
-        "Content-Type": content_type,
-        "Host": url.netloc,
-        "If-None-Match": "*",
-        "User-Agent": client._user_agent,
-        "x-amz-date": minio_time.to_amz_date(request_time),
-    }
-    credentials = client._provider.retrieve() if client._provider else None
-    if credentials:
-        content_sha256 = (
-            "UNSIGNED-PAYLOAD" if client._base_url.is_https else _stream_sha256(data)
-        )
-        headers["x-amz-content-sha256"] = content_sha256
-        if credentials.session_token:
-            headers["X-Amz-Security-Token"] = credentials.session_token
-        headers = sign_v4_s3(
-            method="PUT",
-            url=url,
-            region=region,
-            headers=headers,
-            credentials=credentials,
-            content_sha256=content_sha256,
-            date=request_time,
-        )
-    response = client._http.urlopen(
-        "PUT",
-        urlunsplit(url),
-        body=data,
-        headers=headers,
-        preload_content=True,
-    )
-    if response.status in (200, 204):
-        return True
-    if response.status == 412:
-        return False
-    raise RuntimeError(f"conditional MinIO write returned HTTP {response.status}")
-
-
-def _stream_sha256(data: BinaryIO) -> str:
-    position = data.tell()
-    digest = hashlib.sha256()
-    while chunk := data.read(HASH_CHUNK_SIZE):
-        digest.update(chunk)
-    data.seek(position)
-    return digest.hexdigest()

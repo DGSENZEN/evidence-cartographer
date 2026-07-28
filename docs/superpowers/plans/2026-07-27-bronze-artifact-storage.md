@@ -4,7 +4,7 @@
 
 **Goal:** Persist complete source artifacts and streamed record-level contract evidence as immutable, completion-marked Bronze bundles in MinIO.
 
-**Architecture:** Application models define an acquired artifact, record evidence, stored-object metadata, the completed bundle receipt, and the `BronzeArtifactStore` port. Infrastructure code builds deterministic partitioned keys and implements the port with an injected MinIO-compatible client; the original file, NDJSON evidence, and `_SUCCESS.json` are uploaded in that order.
+**Architecture:** Application models define an acquired artifact, record evidence, stored-object metadata, the completed bundle receipt, and the `BronzeArtifactStore` port. Infrastructure code builds deterministic partitioned keys and implements the port with an injected owned `ConditionalObjectClient`; production composition wraps the exact-pinned MinIO SDK. The original file, NDJSON evidence, and `_SUCCESS.json` are conditionally created in that order.
 
 **Tech Stack:** Python 3.12, Pydantic 2, MinIO Python SDK, pytest, Ruff, mypy, uv.
 
@@ -12,10 +12,14 @@
 
 - Store the original acquired artifact byte-for-byte unchanged.
 - Stream artifacts and record evidence; never materialize a complete museum snapshot or evidence iterable in memory.
+- Limit every conditional single-PUT payload to 5 GiB (5,368,709,120 bytes);
+  multipart upload is outside this boilerplate slice.
 - Use `{bronze_prefix}/{source}/year=YYYY/month=MM/day=DD/run={run_id}/` as the deterministic key prefix.
 - Upload `source.{extension}`, `records.manifest.jsonl`, then `_SUCCESS.json`.
 - Treat `_SUCCESS.json` as the only committed-bundle marker.
 - Never overwrite or automatically delete an object.
+- Disable implicit HTTP retries and redirects; own bounded rewind-and-re-sign
+  retries and reconcile ambiguous results from checksum/size metadata.
 - A retry after a partial write uses a new ingestion-run ID.
 - Preserve the complete `SourceRecord` and `ContractResult` for every evidence line.
 - Do not implement acquisition, parsing, mapping, bucket creation, live-service tests, compression, or storage cleanup.
@@ -30,9 +34,12 @@
 - `src/evidence_cartographer/application/ports.py`: remove the superseded per-record `BronzeWriter`.
 - `src/evidence_cartographer/application/errors.py`: typed Bronze storage failures.
 - `src/evidence_cartographer/infrastructure/object_keys.py`: deterministic Bronze key construction.
+- `src/evidence_cartographer/infrastructure/conditional_object_client.py`: owned conditional-create protocol and exact-pinned MinIO wrapper.
 - `src/evidence_cartographer/infrastructure/minio_bronze.py`: streaming MinIO adapter.
 - `tests/application/test_bronze.py`: application type and port invariants.
 - `tests/infrastructure/test_object_keys.py`: deterministic key and extension tests.
+- `tests/infrastructure/test_minio_conditional_object_client.py`: real-client
+  composition, private-API, retry, and reconciliation contract tests.
 - `tests/infrastructure/test_minio_bronze.py`: fake-client storage behavior.
 - `tests/application/test_ports.py`: remove assertions for the superseded `BronzeWriter`.
 - `tests/config/test_manifests.py`: repository environment-file policy.
@@ -329,8 +336,7 @@ def test_builds_utc_partitioned_bundle_keys() -> None:
     keys = build_bronze_object_keys(artifact, "/raw/")
 
     expected_prefix = (
-        "raw/met/year=2026/month=07/day=28/"
-        "run=00000000-0000-0000-0000-000000000042"
+        "raw/met/year=2026/month=07/day=28/run=00000000-0000-0000-0000-000000000042"
     )
     assert keys.artifact == f"{expected_prefix}/source.csv"
     assert keys.evidence_manifest == f"{expected_prefix}/records.manifest.jsonl"
@@ -427,6 +433,10 @@ git commit -m "feat: add deterministic Bronze object keys"
 
 ### Task 3: Implement the streaming MinIO Bronze adapter
 
+> The step-by-step code below records the initial implementation sequence. The
+> authoritative as-built boundary and final-review changes are summarized in
+> **As-Built Final Review Amendments** below.
+
 **Files:**
 - Create: `src/evidence_cartographer/infrastructure/minio_bronze.py`
 - Create: `tests/infrastructure/test_minio_bronze.py`
@@ -434,7 +444,9 @@ git commit -m "feat: add deterministic Bronze object keys"
 **Interfaces:**
 - Consumes: `BronzeArtifact`, lazy `Iterable[BronzeRecordEvidence]`, and `BronzeObjectKeys`
 - Produces: `MinioBronzeArtifactStore.store_bundle(...) -> BronzeBundleReceipt`
-- Depends on: injected `MinioClient` structural protocol with `stat_object` and `put_object`
+- Depends on: injected `ConditionalObjectClient` structural protocol with
+  `stat_object` and conditional `put_object_if_absent`; production supplies
+  `MinioConditionalObjectClient(minio_client)`.
 
 - [ ] **Step 1: Write a fake client and failing success-path test**
 
@@ -630,12 +642,13 @@ def test_stores_original_artifact_evidence_and_completion_marker(
         "quarantined": 1,
         "rejected": 0,
     }
-    assert completion["artifact"]["sha256"] == hashlib.sha256(
-        artifact_bytes
-    ).hexdigest()
-    assert completion["evidence_manifest"]["sha256"] == hashlib.sha256(
-        evidence_payload
-    ).hexdigest()
+    assert (
+        completion["artifact"]["sha256"] == hashlib.sha256(artifact_bytes).hexdigest()
+    )
+    assert (
+        completion["evidence_manifest"]["sha256"]
+        == hashlib.sha256(evidence_payload).hexdigest()
+    )
     assert receipt.artifact.size_bytes == len(artifact_bytes)
     assert receipt.evidence_manifest.size_bytes == len(evidence_payload)
     assert receipt.completion_manifest_uri == f"s3://bronze/{success_key}"
@@ -916,10 +929,7 @@ def test_rejects_existing_key_before_upload(
     client = FakeMinioClient()
     store = MinioBronzeArtifactStore(client, "bronze", "raw")
     artifact = make_artifact(path)
-    existing_key = (
-        "raw/met/year=2026/month=07/day=27/"
-        f"run={RUN_ID}/{existing_suffix}"
-    )
+    existing_key = f"raw/met/year=2026/month=07/day=27/run={RUN_ID}/{existing_suffix}"
     client.objects[existing_key] = b"existing"
 
     with pytest.raises(ObjectAlreadyExistsError):
@@ -938,10 +948,7 @@ def test_does_not_write_success_marker_after_upload_failure(
     path = tmp_path / "met.csv"
     path.write_bytes(b"source")
     client = FakeMinioClient()
-    failed_key = (
-        "raw/met/year=2026/month=07/day=27/"
-        f"run={RUN_ID}/{failed_suffix}"
-    )
+    failed_key = f"raw/met/year=2026/month=07/day=27/run={RUN_ID}/{failed_suffix}"
     client.fail_on = failed_key
     store = MinioBronzeArtifactStore(client, "bronze", "raw")
 
@@ -1167,7 +1174,40 @@ git commit -m "docs: keep environment configuration local"
 - **Type consistency:** `BronzeArtifact`, `BronzeRecordEvidence`,
   `BronzeBundleReceipt`, `BronzeCompletionManifest`, and `StoredObject` are
   defined in Task 1 and consumed with identical names in Tasks 2 and 3.
-- **Memory behavior:** The artifact is read in chunks and reopened for upload;
-  evidence is iterated once into a bounded `SpooledTemporaryFile`.
+- **Memory behavior:** The artifact is snapshotted in chunks, uploaded, and its
+  configurable spool is closed before evidence is iterated once into a second
+  configurable `SpooledTemporaryFile`.
 - **Immutability:** All three target keys are checked before the first upload,
   and `_SUCCESS.json` is always written last.
+
+## As-Built Final Review Amendments
+
+This section is authoritative where it differs from the initial implementation
+sketches above.
+
+- `MinioBronzeArtifactStore` accepts only the owned
+  `ConditionalObjectClient` protocol. `MinioConditionalObjectClient` composes a
+  real `minio.Minio`; the store has no `isinstance(Minio)` branch.
+- Conditional request internals are isolated in
+  `infrastructure/conditional_object_client.py`. Because the public SDK does
+  not expose `If-None-Match`, the verified private-member contract is pinned to
+  `minio==7.2.20` and `urllib3==2.7.0`.
+- Artifact, evidence, and completion payloads each have a typed 5 GiB
+  single-PUT ceiling. Every create stores expected SHA-256 and byte size in
+  object metadata.
+- urllib3 retries and redirects are disabled for the PUT. The wrapper owns
+  three attempts, rewinds and signs afresh each time, retries HTTP 409 and
+  transient server statuses, and reconciles 412 or ambiguous outcomes by
+  comparing stored checksum and size metadata.
+- Response diagnostics preserve HTTP status, S3 code/message, request ID, and
+  host ID. A matching object after an ambiguous response is success; a
+  mismatching object is `ObjectAlreadyExistsError`; an absent object can be
+  retried within the bound.
+- `ArtifactStagingError` and `EvidenceStagingError` distinguish local staging
+  I/O from integrity, serialization, collision, and object-store failures.
+- The spool memory threshold and directory are constructor options. The
+  artifact spool closes before evidence staging, so temporary capacity is the
+  larger payload (up to 5 GiB plus overhead), not artifact plus evidence.
+- Bronze is create-only by bundle: new runs add new immutable prefixes. The
+  adapter never appends to an existing object, overwrites one, or deletes a
+  partial prefix.

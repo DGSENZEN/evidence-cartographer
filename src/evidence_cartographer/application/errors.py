@@ -30,6 +30,14 @@ class ArtifactIntegrityError(StorageError):
     """The acquired artifact does not match its expected checksum."""
 
 
+class ArtifactStagingError(StorageError):
+    """The acquisition artifact could not be staged for upload."""
+
+
+class EvidenceStagingError(StorageError):
+    """The record-evidence payload could not be staged for upload."""
+
+
 class ObjectAlreadyExistsError(StorageError):
     """A deterministic Bronze object key already exists."""
 
@@ -40,3 +48,21 @@ class ManifestSerializationError(StorageError):
 
 class ObjectStoreError(StorageError):
     """The object store rejected a Bronze operation."""
+
+
+class SinglePutSizeLimitError(StorageError):
+    """A payload exceeds the supported conditional single-PUT ceiling."""
+
+    def __init__(
+        self,
+        object_uri: str,
+        size_bytes: int,
+        max_size_bytes: int,
+    ) -> None:
+        self.object_uri = object_uri
+        self.size_bytes = size_bytes
+        self.max_size_bytes = max_size_bytes
+        super().__init__(
+            f"{object_uri} is {size_bytes} bytes; conditional single-PUT supports "
+            f"at most {max_size_bytes} bytes"
+        )

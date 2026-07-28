@@ -2,6 +2,7 @@ import hashlib
 import json
 from collections.abc import Iterable
 from datetime import UTC, datetime
+from io import BytesIO
 from pathlib import Path
 from typing import Any, BinaryIO
 from uuid import UUID, uuid4
@@ -21,9 +22,12 @@ from evidence_cartographer.application.contracts import (
 from evidence_cartographer.application.errors import (
     ArtifactIntegrityError,
     ArtifactNotFoundError,
+    ArtifactStagingError,
+    EvidenceStagingError,
     ManifestSerializationError,
     ObjectAlreadyExistsError,
     ObjectStoreError,
+    SinglePutSizeLimitError,
 )
 from evidence_cartographer.domain.enums import (
     ContractOutcome,
@@ -32,6 +36,12 @@ from evidence_cartographer.domain.enums import (
     SourceName,
 )
 from evidence_cartographer.domain.models import AcquisitionContext, SourceRecord
+from evidence_cartographer.infrastructure.conditional_object_client import (
+    ConditionalObjectExistsError,
+    ConditionalObjectMetadata,
+    ConditionalPutDiagnostic,
+    MinioConditionalObjectClient,
+)
 from evidence_cartographer.infrastructure.minio_bronze import (
     MinioBronzeArtifactStore,
 )
@@ -61,15 +71,26 @@ class FakeMinioClient:
         self.fail_on: str | None = None
         self.create_before_put: str | None = None
         self.mutate_path_on_stat: tuple[Path, bytes] | None = None
+        self.streams: dict[str, BinaryIO] = {}
+        self.sha256_metadata: dict[str, str] = {}
 
-    def stat_object(self, bucket_name: str, object_name: str) -> object:
+    def stat_object(
+        self,
+        bucket_name: str,
+        object_name: str,
+    ) -> ConditionalObjectMetadata:
         if self.mutate_path_on_stat is not None:
             path, replacement = self.mutate_path_on_stat
             path.write_bytes(replacement)
             self.mutate_path_on_stat = None
         if object_name not in self.objects:
             raise missing_object_error(bucket_name, object_name)
-        return object()
+        payload = self.objects[object_name]
+        return ConditionalObjectMetadata(
+            size_bytes=len(payload),
+            sha256=self.sha256_metadata.get(object_name),
+            declared_size_bytes=len(payload),
+        )
 
     def put_object_if_absent(
         self,
@@ -77,29 +98,21 @@ class FakeMinioClient:
         object_name: str,
         data: BinaryIO,
         length: int,
+        sha256: str,
         content_type: str = "application/octet-stream",
-    ) -> bool:
+    ) -> None:
         self._create_racing_object(object_name)
         if self.fail_on == object_name:
             raise RuntimeError("synthetic MinIO failure")
         if object_name in self.objects:
-            return False
-        self._store(object_name, data, length, content_type)
-        return True
-
-    def put_object(
-        self,
-        bucket_name: str,
-        object_name: str,
-        data: BinaryIO,
-        length: int,
-        content_type: str = "application/octet-stream",
-    ) -> object:
-        self._create_racing_object(object_name)
-        if self.fail_on == object_name:
-            raise RuntimeError("synthetic MinIO failure")
-        self._store(object_name, data, length, content_type)
-        return object()
+            raise ConditionalObjectExistsError(
+                ConditionalPutDiagnostic(
+                    status_code=412,
+                    code="PreconditionFailed",
+                    message="synthetic object exists",
+                )
+            )
+        self._store(object_name, data, length, sha256, content_type)
 
     def _create_racing_object(self, object_name: str) -> None:
         if self.create_before_put == object_name:
@@ -111,11 +124,14 @@ class FakeMinioClient:
         object_name: str,
         data: BinaryIO,
         length: int,
+        sha256: str,
         content_type: str,
     ) -> None:
+        self.streams[object_name] = data
         payload = data.read(length)
         assert len(payload) == length
         self.objects[object_name] = payload
+        self.sha256_metadata[object_name] = sha256
         self.content_types[object_name] = content_type
         self.upload_order.append(object_name)
 
@@ -253,6 +269,11 @@ def test_stores_original_artifact_evidence_and_completion_marker(
     assert receipt.artifact.size_bytes == len(artifact_bytes)
     assert receipt.evidence_manifest.size_bytes == len(evidence_payload)
     assert receipt.completion_manifest_uri == f"s3://bronze/{success_key}"
+    assert client.sha256_metadata == {
+        artifact_key: hashlib.sha256(artifact_bytes).hexdigest(),
+        evidence_key: hashlib.sha256(evidence_payload).hexdigest(),
+        success_key: hashlib.sha256(client.objects[success_key]).hexdigest(),
+    }
 
 
 def test_rejects_missing_artifact(tmp_path: Path) -> None:
@@ -269,6 +290,152 @@ def test_rejects_checksum_mismatch_before_upload(tmp_path: Path) -> None:
     with pytest.raises(ArtifactIntegrityError):
         store.store_bundle(make_artifact(path, "0" * 64), ())
     assert client.upload_order == []
+
+
+def test_translates_artifact_read_failure_to_typed_staging_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "met.csv"
+    path.write_bytes(b"source")
+    real_open = Path.open
+
+    def failing_open(
+        candidate: Path,
+        *args: Any,
+        **kwargs: Any,
+    ) -> BinaryIO:
+        if candidate == path:
+            raise OSError("synthetic artifact read failure")
+        return real_open(candidate, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", failing_open)
+    store = MinioBronzeArtifactStore(FakeMinioClient(), "bronze", "raw")
+
+    with pytest.raises(ArtifactStagingError) as raised:
+        store.store_bundle(make_artifact(path), ())
+
+    assert isinstance(raised.value.__cause__, OSError)
+
+
+def test_configurable_spool_directory_reports_artifact_disk_failure(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "met.csv"
+    path.write_bytes(b"source")
+    client = FakeMinioClient()
+    store = MinioBronzeArtifactStore(
+        client,
+        "bronze",
+        "raw",
+        spool_max_memory_bytes=1,
+        spool_directory=tmp_path / "missing",
+    )
+
+    with pytest.raises(ArtifactStagingError):
+        store.store_bundle(make_artifact(path), ())
+
+    assert client.upload_order == []
+
+
+def test_configurable_spool_directory_reports_evidence_disk_failure(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "met.csv"
+    path.write_bytes(b"")
+    client = FakeMinioClient()
+    store = MinioBronzeArtifactStore(
+        client,
+        "bronze",
+        "raw",
+        spool_max_memory_bytes=1,
+        spool_directory=tmp_path / "missing",
+    )
+
+    with pytest.raises(EvidenceStagingError):
+        store.store_bundle(
+            make_artifact(path),
+            (make_evidence(ContractOutcome.ACCEPTED, "42"),),
+        )
+
+    assert client.upload_order == [
+        f"raw/met/year=2026/month=07/day=27/run={RUN_ID}/source.csv"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("artifact_bytes", "evidence", "expected_uploads"),
+    [
+        (b"123456", (), 0),
+        (b"", (make_evidence(ContractOutcome.ACCEPTED, "42"),), 1),
+        (b"", (), 2),
+    ],
+    ids=("artifact", "evidence", "completion"),
+)
+def test_applies_single_put_ceiling_to_every_bundle_payload(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    artifact_bytes: bytes,
+    evidence: tuple[BronzeRecordEvidence, ...],
+    expected_uploads: int,
+) -> None:
+    path = tmp_path / "met.csv"
+    path.write_bytes(artifact_bytes)
+    client = FakeMinioClient()
+    store = MinioBronzeArtifactStore(client, "bronze", "raw")
+    monkeypatch.setattr(
+        "evidence_cartographer.infrastructure.minio_bronze.MAX_SINGLE_PUT_SIZE_BYTES",
+        5,
+    )
+
+    with pytest.raises(SinglePutSizeLimitError) as raised:
+        store.store_bundle(make_artifact(path), evidence)
+
+    assert raised.value.max_size_bytes == 5
+    assert len(client.upload_order) == expected_uploads
+    assert not any(key.endswith("/_SUCCESS.json") for key in client.objects)
+
+
+def test_stops_reading_artifact_when_single_put_ceiling_is_crossed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class CountingSource(BytesIO):
+        read_calls = 0
+
+        def read(self, size: int = -1) -> bytes:
+            self.read_calls += 1
+            return super().read(size)
+
+    path = tmp_path / "met.csv"
+    path.write_bytes(b"real path only establishes a regular file")
+    source = CountingSource(b"0123456789")
+    real_open = Path.open
+
+    def tracked_open(
+        candidate: Path,
+        *args: Any,
+        **kwargs: Any,
+    ) -> BinaryIO:
+        if candidate == path:
+            return source
+        return real_open(candidate, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", tracked_open)
+    monkeypatch.setattr(
+        "evidence_cartographer.infrastructure.minio_bronze.HASH_CHUNK_SIZE",
+        4,
+    )
+    monkeypatch.setattr(
+        "evidence_cartographer.infrastructure.minio_bronze.MAX_SINGLE_PUT_SIZE_BYTES",
+        5,
+    )
+    store = MinioBronzeArtifactStore(FakeMinioClient(), "bronze", "raw")
+
+    with pytest.raises(SinglePutSizeLimitError):
+        store.store_bundle(make_artifact(path), ())
+
+    assert source.read_calls == 2
 
 
 def test_rejects_racing_writer_without_overwriting_its_artifact(
@@ -308,6 +475,23 @@ def test_uploads_the_hashed_artifact_snapshot_when_local_file_mutates(
     assert receipt.artifact.sha256 == hashlib.sha256(original_bytes).hexdigest()
 
 
+def test_closes_artifact_spool_before_evidence_staging(tmp_path: Path) -> None:
+    path = tmp_path / "met.csv"
+    path.write_bytes(b"source")
+    artifact_key = f"raw/met/year=2026/month=07/day=27/run={RUN_ID}/source.csv"
+    client = FakeMinioClient()
+    store = MinioBronzeArtifactStore(client, "bronze", "raw")
+    observed_closed_state: list[bool] = []
+
+    def evidence() -> Iterable[BronzeRecordEvidence]:
+        observed_closed_state.append(client.streams[artifact_key].closed)
+        yield make_evidence(ContractOutcome.ACCEPTED, "42")
+
+    store.store_bundle(make_artifact(path), evidence())
+
+    assert observed_closed_state == [True]
+
+
 def test_real_minio_client_uses_streaming_conditional_puts(tmp_path: Path) -> None:
     artifact_bytes = b"source"
     path = tmp_path / "met.csv"
@@ -320,7 +504,11 @@ def test_real_minio_client_uses_streaming_conditional_puts(tmp_path: Path) -> No
         region="us-east-1",
     )
     client._http = http_client  # type: ignore[assignment]
-    store = MinioBronzeArtifactStore(client, "bronze", "raw")
+    store = MinioBronzeArtifactStore(
+        MinioConditionalObjectClient(client),
+        "bronze",
+        "raw",
+    )
 
     receipt = store.store_bundle(
         make_artifact(path),

@@ -1,4 +1,5 @@
 import subprocess
+import tomllib
 from pathlib import Path
 
 import yaml
@@ -9,6 +10,7 @@ EXPECTED_OUTCOMES = [
     "quarantined",
     "rejected",
 ]
+
 EXPECTED_PROVENANCE = [
     "source_record_id",
     "ingestion_run_id",
@@ -19,6 +21,40 @@ EXPECTED_PROVENANCE = [
     "raw_uri",
     "acquisition_context",
 ]
+
+
+def test_private_minio_request_dependencies_are_exactly_pinned() -> None:
+    with Path("pyproject.toml").open("rb") as project_file:
+        project = tomllib.load(project_file)
+    with Path("uv.lock").open("rb") as lock_file:
+        lock = tomllib.load(lock_file)
+    dependencies = set(project["project"]["dependencies"])
+    root_package = next(
+        package
+        for package in lock["package"]
+        if package["name"] == "evidence-cartographer"
+    )
+    locked_requirements = {
+        requirement["name"]: requirement["specifier"]
+        for requirement in root_package["metadata"]["requires-dist"]
+        if requirement["name"] in {"minio", "urllib3"}
+    }
+    locked_versions = {
+        package["name"]: package["version"]
+        for package in lock["package"]
+        if package["name"] in {"minio", "urllib3"}
+    }
+
+    assert "minio==7.2.20" in dependencies
+    assert "urllib3==2.7.0" in dependencies
+    assert locked_requirements == {
+        "minio": "==7.2.20",
+        "urllib3": "==2.7.0",
+    }
+    assert locked_versions == {
+        "minio": "7.2.20",
+        "urllib3": "2.7.0",
+    }
 
 
 def test_source_contract_manifests_are_versioned() -> None:
