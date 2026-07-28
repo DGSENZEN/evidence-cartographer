@@ -9,9 +9,9 @@ collection metadata.
 - **Silver:** all valid normalized records with quality evidence and history.
 - **Gold:** records that pass explicit rights, image, and metadata-quality gates.
 
-The repository contains only the initial package and configuration scaffold.
-Museum mappings, quality policy, and production ingestion are intentionally not
-implemented.
+The repository contains the package/configuration scaffold and the first Met
+full-snapshot-to-Bronze vertical slice. Museum canonical mappings and Gold
+quality policy are intentionally not implemented yet.
 
 ## Setup
 
@@ -42,6 +42,18 @@ uv run ruff format --check .
 uv run mypy src
 docker compose --env-file .env -f infra/compose.yaml config --quiet
 ```
+
+## Live source tests
+
+The normal pytest suite downloads and processes the complete official Met Open
+Access CSV. The verified artifact is cached under `.pytest_cache/met`; set
+`EC_TEST_MET_SNAPSHOT_CACHE_DIR` to use another local cache directory.
+Subsequent sessions issue a conditional request and reuse the cache only after
+size and SHA-256 verification.
+
+The live test intentionally fails when the public source is unavailable or its
+required schema changes. It does not require MinIO, PostgreSQL, or local
+credentials.
 
 ## Package boundaries
 
