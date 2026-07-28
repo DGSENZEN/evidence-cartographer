@@ -71,7 +71,14 @@ class RefreshSettings(BaseModel):
 
 class SourceEndpoints(BaseModel):
     met_api_base_url: str = "https://collectionapi.metmuseum.org/public/collection/v1"
+    met_snapshot_url: str = (
+        "https://github.com/metmuseum/openaccess/raw/refs/heads/master/MetObjects.csv"
+    )
     aic_api_base_url: str = "https://api.artic.edu/api/v1"
+    http_connect_timeout_seconds: float = Field(default=10.0, gt=0)
+    http_read_timeout_seconds: float = Field(default=300.0, gt=0)
+    download_chunk_size_bytes: int = Field(default=1024 * 1024, gt=0)
+    met_csv_batch_size: int = Field(default=50_000, gt=0)
 
 
 class Settings(BaseSettings):

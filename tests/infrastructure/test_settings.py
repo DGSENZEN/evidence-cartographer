@@ -77,3 +77,20 @@ def test_empty_optional_prefect_values_normalize_to_none(
 
     assert settings.prefect.api_url is None
     assert settings.prefect.work_pool_name is None
+
+
+def test_met_snapshot_acquisition_defaults() -> None:
+    settings = Settings.model_validate(
+        {
+            "postgres": {"password": "test"},
+            "object_store": {
+                "access_key": "test",
+                "secret_key": "test",
+            },
+        }
+    )
+    assert settings.sources.met_snapshot_url.endswith("/MetObjects.csv")
+    assert settings.sources.http_connect_timeout_seconds == 10.0
+    assert settings.sources.http_read_timeout_seconds == 300.0
+    assert settings.sources.download_chunk_size_bytes == 1024 * 1024
+    assert settings.sources.met_csv_batch_size == 50_000

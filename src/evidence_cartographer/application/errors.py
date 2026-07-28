@@ -22,6 +22,26 @@ class QualityError(EvidenceCartographerError):
     """A data-quality operation failed."""
 
 
+class HttpDownloadError(AcquisitionError):
+    """A source HTTP request failed or returned a terminal status."""
+
+
+class DownloadIntegrityError(AcquisitionError):
+    """A downloaded artifact is empty, truncated, or length-mismatched."""
+
+
+class DownloadSizeLimitError(AcquisitionError):
+    """A downloaded artifact exceeds the supported artifact ceiling."""
+
+
+class MetCsvSchemaError(ContractError):
+    """The Met CSV header does not satisfy the versioned contract."""
+
+
+class MetCsvParseError(ContractError):
+    """The Met CSV cannot be segmented into readable records."""
+
+
 class ArtifactNotFoundError(StorageError):
     """The local acquisition artifact is missing or is not a regular file."""
 
