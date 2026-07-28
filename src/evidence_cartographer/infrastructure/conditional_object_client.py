@@ -130,6 +130,7 @@ class MinioConditionalObjectClient(ConditionalObjectClient):
                 MAX_SINGLE_PUT_SIZE_BYTES,
             )
         start_position = data.tell()
+        had_ambiguous_attempt = False
         for attempt in range(MAX_CONDITIONAL_PUT_ATTEMPTS):
             data.seek(start_position)
             try:
@@ -161,12 +162,15 @@ class MinioConditionalObjectClient(ConditionalObjectClient):
                 if state is _ReconciliationState.CONFLICT:
                     raise ConditionalObjectExistsError(diagnostic) from exc
                 if attempt + 1 < MAX_CONDITIONAL_PUT_ATTEMPTS:
+                    had_ambiguous_attempt = True
                     continue
                 raise ConditionalPutError(diagnostic, attempt + 1) from exc
             if response.status in (200, 204):
                 return
             diagnostic = _response_diagnostic(response)
             if response.status == 412:
+                if not had_ambiguous_attempt:
+                    raise ConditionalObjectExistsError(diagnostic)
                 try:
                     state = self._reconcile_object(
                         bucket_name,
@@ -206,6 +210,7 @@ class MinioConditionalObjectClient(ConditionalObjectClient):
                 if state is _ReconciliationState.CONFLICT:
                     raise ConditionalObjectExistsError(diagnostic)
                 if attempt + 1 < MAX_CONDITIONAL_PUT_ATTEMPTS:
+                    had_ambiguous_attempt = True
                     continue
                 raise ConditionalPutError(diagnostic, attempt + 1)
             if response.status in RETRYABLE_STATUS_CODES:

@@ -271,15 +271,6 @@ def test_retries_http_409_with_a_rewound_and_freshly_signed_request(
     "response",
     [
         FakeHttpResponse(
-            412,
-            data=(
-                b"<Error><Code>PreconditionFailed</Code>"
-                b"<Message>object exists</Message>"
-                b"<RequestId>request-412</RequestId></Error>"
-            ),
-            headers={"content-type": "application/xml"},
-        ),
-        FakeHttpResponse(
             503,
             data=(
                 b"<Error><Code>SlowDown</Code><Message>retry later</Message></Error>"
@@ -289,7 +280,7 @@ def test_retries_http_409_with_a_rewound_and_freshly_signed_request(
         TimeoutError("response lost after upload"),
     ],
 )
-def test_reconciles_ambiguous_or_412_result_when_stored_metadata_matches(
+def test_reconciles_ambiguous_result_when_stored_metadata_matches(
     response: FakeHttpResponse | Exception,
 ) -> None:
     payload = b"committed bytes"
@@ -316,7 +307,7 @@ def test_reconciles_ambiguous_or_412_result_when_stored_metadata_matches(
     assert len(http_client.requests) == 1
 
 
-def test_412_with_different_metadata_preserves_typed_s3_diagnostics() -> None:
+def test_first_412_preserves_typed_s3_diagnostics() -> None:
     payload = b"our bytes"
     response = FakeHttpResponse(
         412,
@@ -328,17 +319,8 @@ def test_412_with_different_metadata_preserves_typed_s3_diagnostics() -> None:
         ),
         headers={"content-type": "application/xml"},
     )
-    stat = Object(
-        bucket_name="bronze",
-        object_name="raw/source.csv",
-        size=5,
-        metadata={
-            "x-amz-meta-ec-sha256": "e" * 64,
-            "x-amz-meta-ec-size": "5",
-        },
-    )
     client = MinioConditionalObjectClient(
-        make_reconciling_client(RecordingHttpClient(response), stat)
+        make_raw_client(RecordingHttpClient(response))
     )
 
     with pytest.raises(ConditionalObjectExistsError) as raised:
@@ -361,17 +343,16 @@ def test_412_with_different_metadata_preserves_typed_s3_diagnostics() -> None:
     "first_result",
     [
         FakeHttpResponse(
-            412,
+            503,
             data=(
-                b"<Error><Code>PreconditionFailed</Code>"
-                b"<Message>object exists</Message></Error>"
+                b"<Error><Code>SlowDown</Code><Message>retry later</Message></Error>"
             ),
             headers={"content-type": "application/xml"},
         ),
         TimeoutError("response lost"),
     ],
 )
-def test_retries_when_reconciliation_finds_no_object(
+def test_retries_ambiguous_result_when_reconciliation_finds_no_object(
     first_result: FakeHttpResponse | Exception,
 ) -> None:
     payload = b"retry after stat"
@@ -389,6 +370,52 @@ def test_retries_when_reconciliation_finds_no_object(
         BytesIO(payload),
         len(payload),
         "1" * 64,
+    )
+
+    assert [request["body"] for request in http_client.requests] == [
+        payload,
+        payload,
+    ]
+
+
+def test_reconciles_matching_412_after_an_ambiguous_prior_attempt() -> None:
+    payload = b"committed before response was lost"
+    digest = "3" * 64
+    matching_stat = Object(
+        bucket_name="bronze",
+        object_name="raw/source.csv",
+        size=len(payload),
+        metadata={
+            "x-amz-meta-ec-sha256": digest,
+            "x-amz-meta-ec-size": str(len(payload)),
+        },
+    )
+    precondition_failed = FakeHttpResponse(
+        412,
+        data=(
+            b"<Error><Code>PreconditionFailed</Code>"
+            b"<Message>object exists</Message></Error>"
+        ),
+        headers={"content-type": "application/xml"},
+    )
+    http_client = RecordingHttpClient(
+        TimeoutError("response lost"),
+        precondition_failed,
+    )
+    client = MinioConditionalObjectClient(
+        make_sequenced_stat_client(
+            http_client,
+            missing_object_error("bronze", "raw/source.csv"),
+            matching_stat,
+        )
+    )
+
+    client.put_object_if_absent(
+        "bronze",
+        "raw/source.csv",
+        BytesIO(payload),
+        len(payload),
+        digest,
     )
 
     assert [request["body"] for request in http_client.requests] == [

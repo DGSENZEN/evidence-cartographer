@@ -9,7 +9,9 @@ from uuid import UUID, uuid4
 
 import pytest
 from minio import Minio
+from minio.datatypes import Object
 from minio.error import S3Error
+from urllib3 import HTTPHeaderDict
 
 from evidence_cartographer.application.bronze import (
     BronzeArtifact,
@@ -141,15 +143,59 @@ class MissingObjectMinio(Minio):
         raise missing_object_error(bucket_name, object_name)
 
 
+class MatchingAfterPreflightMinio(Minio):
+    def __init__(
+        self,
+        *args: Any,
+        expected_size: int,
+        expected_sha256: str,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self.expected_size = expected_size
+        self.expected_sha256 = expected_sha256
+        self.stat_calls = 0
+
+    def stat_object(self, bucket_name: str, object_name: str) -> Object:
+        self.stat_calls += 1
+        if self.stat_calls <= 3:
+            raise missing_object_error(bucket_name, object_name)
+        return Object(
+            bucket_name=bucket_name,
+            object_name=object_name,
+            size=self.expected_size,
+            metadata={
+                "x-amz-meta-ec-sha256": self.expected_sha256,
+                "x-amz-meta-ec-size": str(self.expected_size),
+            },
+        )
+
+
+class FakeHttpResponse:
+    def __init__(
+        self,
+        status: int,
+        *,
+        data: bytes = b"",
+        headers: dict[str, str] | None = None,
+    ) -> None:
+        self.status = status
+        self.data = data
+        self.headers = HTTPHeaderDict(headers or {})
+
+
 class RecordingHttpClient:
-    def __init__(self) -> None:
+    def __init__(self, *responses: FakeHttpResponse) -> None:
+        self.responses = list(responses)
         self.requests: list[tuple[str, str, bytes, dict[str, str]]] = []
 
     def urlopen(self, method: str, url: str, **kwargs: Any) -> object:
         body = kwargs["body"]
         headers = kwargs["headers"]
         self.requests.append((method, url, body.read(), dict(headers)))
-        return type("Response", (), {"status": 200})()
+        if self.responses:
+            return self.responses.pop(0)
+        return FakeHttpResponse(200)
 
     def clear(self) -> None:
         return None
@@ -519,6 +565,43 @@ def test_real_minio_client_uses_streaming_conditional_puts(tmp_path: Path) -> No
     assert all(request[3]["If-None-Match"] == "*" for request in http_client.requests)
     assert http_client.requests[0][2] == artifact_bytes
     assert receipt.artifact.sha256 == hashlib.sha256(artifact_bytes).hexdigest()
+
+
+def test_first_matching_412_is_store_collision(tmp_path: Path) -> None:
+    artifact_bytes = b"source"
+    artifact_sha256 = hashlib.sha256(artifact_bytes).hexdigest()
+    path = tmp_path / "met.csv"
+    path.write_bytes(artifact_bytes)
+    precondition_failed = FakeHttpResponse(
+        412,
+        data=(
+            b"<Error><Code>PreconditionFailed</Code>"
+            b"<Message>object exists</Message></Error>"
+        ),
+        headers={"content-type": "application/xml"},
+    )
+    http_client = RecordingHttpClient(precondition_failed)
+    client = MatchingAfterPreflightMinio(
+        "minio.test",
+        access_key="access",
+        secret_key="secret",
+        region="us-east-1",
+        expected_size=len(artifact_bytes),
+        expected_sha256=artifact_sha256,
+    )
+    client._http = http_client  # type: ignore[assignment]
+    store = MinioBronzeArtifactStore(
+        MinioConditionalObjectClient(client),
+        "bronze",
+        "raw",
+    )
+
+    with pytest.raises(ObjectAlreadyExistsError) as raised:
+        store.store_bundle(make_artifact(path), ())
+
+    assert isinstance(raised.value.__cause__, ConditionalObjectExistsError)
+    assert client.stat_calls == 3
+    assert len(http_client.requests) == 1
 
 
 def test_preserves_evidence_create_collision_as_object_exists_error(
