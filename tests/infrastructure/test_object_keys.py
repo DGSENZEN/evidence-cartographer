@@ -33,8 +33,7 @@ def test_builds_utc_partitioned_bundle_keys() -> None:
     keys = build_bronze_object_keys(artifact, "/raw/")
 
     expected_prefix = (
-        "raw/met/year=2026/month=07/day=28/"
-        "run=00000000-0000-0000-0000-000000000042"
+        "raw/met/year=2026/month=07/day=28/run=00000000-0000-0000-0000-000000000042"
     )
     assert keys.artifact == f"{expected_prefix}/source.csv"
     assert keys.evidence_manifest == f"{expected_prefix}/records.manifest.jsonl"

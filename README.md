@@ -17,12 +17,17 @@ implemented.
 
 ```bash
 uv sync --all-extras
-cp .env.example .env
 ```
 
-After copying the environment file, fill all three required credential values:
-`EC_POSTGRES__PASSWORD`, `EC_OBJECT_STORE__ACCESS_KEY`, and
-`EC_OBJECT_STORE__SECRET_KEY`. Then start the local services:
+Create a local `.env` file. It is ignored by Git and must never be committed.
+Fill these three required values before starting local services:
+
+- `EC_POSTGRES__PASSWORD`
+- `EC_OBJECT_STORE__ACCESS_KEY`
+- `EC_OBJECT_STORE__SECRET_KEY`
+
+Additional optional settings are defined by
+`src/evidence_cartographer/infrastructure/settings.py`.
 
 ```bash
 docker compose --env-file .env -f infra/compose.yaml up -d

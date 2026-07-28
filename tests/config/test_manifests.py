@@ -1,3 +1,4 @@
+import subprocess
 from pathlib import Path
 
 import yaml
@@ -59,35 +60,33 @@ def test_compose_binds_services_to_loopback_without_credential_defaults() -> Non
     )
 
 
-def test_env_example_documents_complete_nested_configuration() -> None:
-    env_example = Path(".env.example").read_text()
-    expected_keys = {
-        "EC_LAKE__BRONZE_PREFIX",
-        "EC_LAKE__MANIFEST_PREFIX",
-        "EC_LAKE__QUARANTINE_PREFIX",
-        "EC_LAKE__SILVER_PREFIX",
-        "EC_LAKE__GOLD_PREFIX",
-        "EC_PREFECT__API_URL",
-        "EC_PREFECT__WORK_POOL_NAME",
-        "EC_CONTRACTS__MET_VERSION",
-        "EC_CONTRACTS__AIC_VERSION",
-        "EC_IMAGE_CACHE__ENABLED",
-        "EC_IMAGE_CACHE__PREFIX",
-        "EC_IMAGE_CACHE__SELECTION",
-    }
-    documented_keys = {
-        line.split("=", maxsplit=1)[0]
-        for line in env_example.splitlines()
-        if line and not line.startswith("#") and "=" in line
-    }
-    assert expected_keys <= documented_keys
+def test_repository_has_no_environment_template() -> None:
+    assert not Path(".env.example").exists()
 
 
-def test_required_credentials_remain_blank_in_env_example() -> None:
-    env_lines = set(Path(".env.example").read_text().splitlines())
-    assert "EC_POSTGRES__PASSWORD=" in env_lines
-    assert "EC_OBJECT_STORE__ACCESS_KEY=" in env_lines
-    assert "EC_OBJECT_STORE__SECRET_KEY=" in env_lines
+def test_real_environment_file_is_ignored_and_untracked() -> None:
+    ignored = subprocess.run(
+        ["git", "check-ignore", "--quiet", ".env"],
+        check=False,
+    )
+    tracked = subprocess.run(
+        ["git", "ls-files", "--error-unmatch", ".env"],
+        check=False,
+        capture_output=True,
+    )
+    assert ignored.returncode == 0
+    assert tracked.returncode != 0
+
+
+def test_readme_documents_required_environment_names_without_values() -> None:
+    readme = Path("README.md").read_text()
+    required = (
+        "EC_POSTGRES__PASSWORD",
+        "EC_OBJECT_STORE__ACCESS_KEY",
+        "EC_OBJECT_STORE__SECRET_KEY",
+    )
+    assert all(name in readme for name in required)
+    assert ".env.example" not in readme
 
 
 def test_compose_examples_use_the_root_environment_file() -> None:
