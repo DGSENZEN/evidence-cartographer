@@ -53,3 +53,15 @@ threshold and temporary directory are configurable, and the artifact spool is
 closed before evidence staging starts. Operators should provision the selected
 spool directory for the larger payload—up to 5 GiB plus filesystem
 overhead—rather than the sum of both payloads.
+
+## Met full snapshot
+
+The Met full-snapshot service streams the official weekly CSV into a temporary
+artifact, performs required-header preflight, resolves its immutable Bronze
+target, and emits one contract-evidence record per CSV row through bounded
+Polars batches. Prefect delegates to the application service; production
+composition supplies urllib3 and the conditional MinIO client.
+
+Missing headers fail before storage. Added headers are persisted once in the
+completion manifest. Row warnings, quarantine, and rejection remain committed
+to Bronze and do not affect Silver/Gold policy.
