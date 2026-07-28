@@ -1104,11 +1104,11 @@ class MetEvidenceContext(BaseModel):
 `MetCsvEvidenceReader.iter_evidence` must:
 
 1. build a Pandera Polars schema with required columns as nullable strings;
-2. call `pl.read_csv_batched` with `schema_overrides` mapping every preflight
-   column to `pl.String`, `infer_schema_length=0`, `encoding="utf8"`,
-   `empty_string_is_null=True`, `batch_size=self._batch_size`,
-   `row_index_name="__source_row_number"`, and `row_index_offset=2`;
-3. request one batch at a time with `next_batches(1)`;
+2. call `pl.scan_csv` with `schema_overrides` mapping every preflight column to
+   `pl.String`, `infer_schema_length=0`, `encoding="utf8"`,
+   `empty_string_is_null=True`, `row_index_name="__source_row_number"`, and
+   `row_index_offset=2`;
+3. stream batches with `collect_batches(chunk_size=self._batch_size)`;
 4. validate the batch schema;
 5. iterate named rows and remove `__source_row_number` from payload;
 6. parse Object ID and create the fallback `<run-id>:row:<row-number>`;

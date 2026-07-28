@@ -1,7 +1,7 @@
 from collections.abc import Iterable, Mapping
 from typing import Any, Protocol
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from evidence_cartographer.application.contracts import (
     ContractResult,
@@ -25,6 +25,7 @@ class RawRecord(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     source_record_id: str
+    source_row_number: int | None = Field(default=None, ge=2)
     payload: Mapping[str, Any]
 
 

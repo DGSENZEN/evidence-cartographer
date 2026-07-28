@@ -61,6 +61,15 @@ def test_source_adapter_receives_the_exact_retry_decider() -> None:
     assert adapter.received_decider is retry_decider
 
 
+def test_raw_record_can_retain_csv_source_row_number() -> None:
+    record = RawRecord(
+        source_record_id="42",
+        source_row_number=2,
+        payload={"Object ID": "42"},
+    )
+    assert record.source_row_number == 2
+
+
 def test_silver_writer_exposes_append_only_canonical_version_boundary() -> None:
     assert hasattr(SilverWriter, "append_version")
     annotations = get_type_hints(SilverWriter.append_version)
