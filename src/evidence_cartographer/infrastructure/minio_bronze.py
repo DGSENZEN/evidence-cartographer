@@ -12,10 +12,12 @@ from evidence_cartographer.application.bronze import (
     BronzeArtifact,
     BronzeArtifactStore,
     BronzeBundleReceipt,
+    BronzeBundleTarget,
     BronzeCompletionManifest,
     BronzeRecordEvidence,
     StoredObject,
 )
+from evidence_cartographer.application.contracts import ValidationMessage
 from evidence_cartographer.application.errors import (
     ArtifactIntegrityError,
     ArtifactNotFoundError,
@@ -60,15 +62,26 @@ class MinioBronzeArtifactStore(BronzeArtifactStore):
         self._spool_max_memory_bytes = spool_max_memory_bytes
         self._spool_directory = spool_directory
 
+    def target_for(self, artifact: BronzeArtifact) -> BronzeBundleTarget:
+        keys = build_bronze_object_keys(artifact, self._bronze_prefix)
+        return BronzeBundleTarget(
+            artifact_uri=self._uri(keys.artifact),
+            evidence_manifest_uri=self._uri(keys.evidence_manifest),
+            completion_manifest_uri=self._uri(keys.completion_manifest),
+        )
+
     def store_bundle(
         self,
         artifact: BronzeArtifact,
         evidence: Iterable[BronzeRecordEvidence],
+        *,
+        contract_messages: tuple[ValidationMessage, ...] = (),
     ) -> BronzeBundleReceipt:
         if not artifact.local_path.is_file():
             raise ArtifactNotFoundError(str(artifact.local_path))
 
         keys = build_bronze_object_keys(artifact, self._bronze_prefix)
+        target = self.target_for(artifact)
         try:
             with SpooledTemporaryFile(
                 max_size=self._spool_max_memory_bytes,
@@ -83,11 +96,11 @@ class MinioBronzeArtifactStore(BronzeArtifactStore):
                 size_bytes, sha256 = self._snapshot_artifact(
                     artifact,
                     binary_snapshot,
-                    self._uri(keys.artifact),
+                    target.artifact_uri,
                 )
                 self._assert_bundle_absent(keys)
                 artifact_object = StoredObject(
-                    uri=self._uri(keys.artifact),
+                    uri=target.artifact_uri,
                     size_bytes=size_bytes,
                     sha256=sha256,
                 )
@@ -120,6 +133,7 @@ class MinioBronzeArtifactStore(BronzeArtifactStore):
             evidence_manifest=evidence_object,
             total_records=total_records,
             outcome_counts=outcome_counts,
+            contract_messages=contract_messages,
         )
         completion_bytes = _canonical_json(completion.model_dump(mode="json"))
         self._put_if_absent(
@@ -134,7 +148,7 @@ class MinioBronzeArtifactStore(BronzeArtifactStore):
             ingestion_run_id=artifact.ingestion_run_id,
             artifact=artifact_object,
             evidence_manifest=evidence_object,
-            completion_manifest_uri=self._uri(keys.completion_manifest),
+            completion_manifest_uri=target.completion_manifest_uri,
         )
 
     def _snapshot_artifact(

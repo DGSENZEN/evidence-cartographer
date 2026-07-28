@@ -12,7 +12,10 @@ from pydantic import (
     field_validator,
 )
 
-from evidence_cartographer.application.contracts import ContractResult
+from evidence_cartographer.application.contracts import (
+    ContractResult,
+    ValidationMessage,
+)
 from evidence_cartographer.domain.enums import ContractOutcome, SourceName
 from evidence_cartographer.domain.models import SourceRecord
 
@@ -59,6 +62,12 @@ class StoredObject(BronzeModel):
     sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
+class BronzeBundleTarget(BronzeModel):
+    artifact_uri: str
+    evidence_manifest_uri: str
+    completion_manifest_uri: str
+
+
 class BronzeCompletionManifest(BronzeModel):
     source: SourceName
     ingestion_run_id: UUID
@@ -69,6 +78,7 @@ class BronzeCompletionManifest(BronzeModel):
     evidence_manifest: StoredObject
     total_records: int = Field(ge=0)
     outcome_counts: dict[ContractOutcome, int]
+    contract_messages: tuple[ValidationMessage, ...] = ()
 
 
 class BronzeBundleReceipt(BronzeModel):
@@ -80,8 +90,12 @@ class BronzeBundleReceipt(BronzeModel):
 
 
 class BronzeArtifactStore(Protocol):
+    def target_for(self, artifact: BronzeArtifact) -> BronzeBundleTarget: ...
+
     def store_bundle(
         self,
         artifact: BronzeArtifact,
         evidence: Iterable[BronzeRecordEvidence],
+        *,
+        contract_messages: tuple[ValidationMessage, ...] = (),
     ) -> BronzeBundleReceipt: ...

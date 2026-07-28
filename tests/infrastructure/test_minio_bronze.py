@@ -322,6 +322,44 @@ def test_stores_original_artifact_evidence_and_completion_marker(
     }
 
 
+def test_target_for_matches_uploaded_bundle_locations(tmp_path: Path) -> None:
+    path = tmp_path / "met.csv"
+    path.write_bytes(b"source")
+    client = FakeMinioClient()
+    store = MinioBronzeArtifactStore(client, "bronze", "raw")
+    artifact = make_artifact(path)
+
+    target = store.target_for(artifact)
+    receipt = store.store_bundle(artifact, ())
+
+    assert target.artifact_uri == receipt.artifact.uri
+    assert target.evidence_manifest_uri == receipt.evidence_manifest.uri
+    assert target.completion_manifest_uri == receipt.completion_manifest_uri
+
+
+def test_persists_bundle_contract_messages_once(tmp_path: Path) -> None:
+    path = tmp_path / "met.csv"
+    path.write_bytes(b"source")
+    client = FakeMinioClient()
+    store = MinioBronzeArtifactStore(client, "bronze", "raw")
+    message = ValidationMessage(
+        rule_id="unexpected_columns",
+        message="Met CSV added columns: Future Field",
+    )
+
+    store.store_bundle(make_artifact(path), (), contract_messages=(message,))
+
+    success_key = next(key for key in client.objects if key.endswith("_SUCCESS.json"))
+    completion = json.loads(client.objects[success_key])
+    assert completion["contract_messages"] == [
+        {
+            "field": None,
+            "message": "Met CSV added columns: Future Field",
+            "rule_id": "unexpected_columns",
+        }
+    ]
+
+
 def test_rejects_missing_artifact(tmp_path: Path) -> None:
     store = MinioBronzeArtifactStore(FakeMinioClient(), "bronze", "raw")
     with pytest.raises(ArtifactNotFoundError):
